@@ -16,7 +16,8 @@ export function downloadTracker(label, say) {
   const files = new Map();
   let last = 0;
   return (e) => {
-    if (e?.status !== 'progress' || !e.file || !e.total) return;
+    // Skip small config files: they finish instantly and would just flash "100%".
+    if (e?.status !== 'progress' || !e.file || !e.total || e.total < 1048576) return;
     files.set(e.file, { loaded: Math.min(e.loaded ?? 0, e.total), total: e.total });
     let loaded = 0;
     let total = 0;

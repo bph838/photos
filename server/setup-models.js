@@ -60,9 +60,8 @@ export async function ensureAllModels(say = consoleSay) {
   await ensureFaceModels(say);
   const clip = await import('./ai/clip.js');
   // Progress lines only appear if something actually needs downloading.
-  const searchProgress = downloadTracker('Downloading photo search model', say);
-  await clip.loadVision(2, searchProgress);
-  await clip.loadText(2, searchProgress);
+  await clip.loadVision(2, downloadTracker('Downloading photo search model (part 1 of 2)', say));
+  await clip.loadText(2, downloadTracker('Downloading photo search model (part 2 of 2)', say));
   await clip.loadDetector(2, downloadTracker('Downloading pet finder model', say));
   say('All models ready.');
 }

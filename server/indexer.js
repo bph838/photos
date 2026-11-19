@@ -118,9 +118,8 @@ async function loadAi() {
   const faces = await import('./ai/faces.js');
   const clip = await import('./ai/clip.js');
   await faces.loadFaceModels(THREADS);
-  const searchProgress = downloadTracker('Downloading photo search model', say);
-  await clip.loadVision(THREADS, searchProgress);
-  await clip.loadText(1, searchProgress);
+  await clip.loadVision(THREADS, downloadTracker('Downloading photo search model (part 1 of 2)', say));
+  await clip.loadText(1, downloadTracker('Downloading photo search model (part 2 of 2)', say));
   await clip.loadDetector(THREADS, downloadTracker('Downloading pet finder model', say));
   starting();
   // Zero-shot "is there an animal in this photo?" check, so the slow pet
