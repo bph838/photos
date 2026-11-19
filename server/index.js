@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fork, spawn, execFile } from 'node:child_process';
 import express from 'express';
 import { openDb, fromBlob, tx } from './db.js';
-import { APP_ROOT, PORT, log, thumbPath } from './paths.js';
+import { APP_ROOT, PORT, log, thumbPath, cropPath } from './paths.js';
 import { makeThumb, makeCloudThumb, makeDisplay, makeCrop, isHeic } from './images.js';
 import { Shell } from './win/shell.js';
 import { detachFromCluster, personCentroid, unit, dot, SUGGEST_THRESHOLD } from './cluster.js';
@@ -170,7 +170,7 @@ app.get('/api/ping', (req, res) => res.json({ ok: true }));
 
 app.get('/api/status', (req, res) => {
   const c = db.prepare(
-    `SELECT COUNT(*) total, SUM(ai_state != 0) analysed, SUM(thumb = 1) thumbs, SUM(cloud = 1) cloud, SUM(cloud = 1 AND ai_state = 0) cloudUnchecked FROM photos WHERE missing = 0`
+    `SELECT COUNT(*) total, SUM(ai_state IN (1, -1)) analysed, SUM(thumb = 1) thumbs, SUM(cloud = 1) cloud, SUM(cloud = 1 AND ai_state NOT IN (1, -1)) cloudUnchecked FROM photos WHERE missing = 0`
   ).get();
   const folders = db.prepare('SELECT COUNT(*) n FROM folders').get().n;
   res.json({
@@ -265,7 +265,7 @@ app.get('/api/photo/:id', (req, res) => {
   res.json({
     id: p.id, path: p.path, folder: p.folder, filename: p.filename, size: p.size, taken: p.taken,
     camera: p.camera, w: p.width, h: p.height, favorite: !!p.favorite, missing: !!p.missing,
-    analysed: p.ai_state !== 0, cloud: !!p.cloud, inPrint, faces,
+    analysed: p.ai_state === 1 || p.ai_state === -1, cloud: !!p.cloud, inPrint, faces,
   });
 });
 
@@ -335,8 +335,19 @@ app.get('/api/face/:id/crop', asyncRoute(async (req, res) => {
   const f = db.prepare('SELECT f.*, p.path, p.cloud FROM faces f JOIN photos p ON p.id = f.photo_id WHERE f.id = ?').get(Number(req.params.id));
   if (!f) return res.status(404).end();
   try {
-    // If the photo has gone back to cloud-only, crop from its preview so nothing is downloaded.
-    const file = await makeCrop(f, f.cloud ? thumbPath(f.photo_id) : f.path);
+    // Cloud-only photo: crop from the OneDrive/iCloud preview so nothing is downloaded.
+    let file;
+    if (f.cloud && !fs.existsSync(cropPath(f.id))) {
+      const png = path.join(os.tmpdir(), `familyphotos-crop-${f.id}-${Date.now()}.png`);
+      try {
+        const ok = await shell.thumbnail(f.path, png);
+        file = await makeCrop(f, ok ? png : thumbPath(f.photo_id));
+      } finally {
+        fs.rmSync(png, { force: true });
+      }
+    } else {
+      file = await makeCrop(f, f.path);
+    }
     res.set('Cache-Control', 'private, max-age=604800');
     res.sendFile(file);
   } catch {

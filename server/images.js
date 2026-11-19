@@ -1,6 +1,7 @@
 // Reading images. Originals are only ever opened for reading.
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import sharp from 'sharp';
 import { thumbPath, cropPath } from './paths.js';
 
@@ -55,6 +56,21 @@ export async function makeCloudThumb(id, file, shell) {
     await img.resize(400, 400, { fit: 'inside', withoutEnlargement: true }).webp({ quality: 72 }).toFile(tmp);
     fs.renameSync(tmp, out);
     return { width: meta.width, height: meta.height };
+  } finally {
+    fs.rmSync(png, { force: true });
+  }
+}
+
+/**
+ * RGB pixels of a cloud-only photo's preview (about 768px), for the AI.
+ * Comes from Windows' thumbnail cache / the sync app: the photo is not downloaded.
+ */
+export async function loadCloudRgb(file, shell) {
+  const png = path.join(os.tmpdir(), `familyphotos-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
+  try {
+    if (!(await shell.thumbnail(file, png))) throw new Error('No preview available from OneDrive/iCloud');
+    const { data, info } = await sharp(png).removeAlpha().toColourspace('srgb').raw().toBuffer({ resolveWithObject: true });
+    return { data, width: info.width, height: info.height };
   } finally {
     fs.rmSync(png, { force: true });
   }

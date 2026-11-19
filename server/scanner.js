@@ -63,7 +63,7 @@ function forgetDerived(db, id) {
 export async function scanLibrary(db, shell, onProgress = () => {}) {
   const roots = db.prepare('SELECT path FROM folders').all().map((r) => r.path);
   const known = new Map();
-  for (const r of db.prepare('SELECT id, path, size, mtime, missing, cloud, thumb FROM photos').all()) known.set(r.path, r);
+  for (const r of db.prepare('SELECT id, path, size, mtime, missing, cloud, thumb, ai_state FROM photos').all()) known.set(r.path, r);
 
   const seen = new Set();
   const reachableRoots = [];
@@ -82,6 +82,7 @@ export async function scanLibrary(db, shell, onProgress = () => {}) {
   // Space freed up again: stay away from the file, keep everything we learned.
   const nowCloud = db.prepare('UPDATE photos SET cloud = 1 WHERE id = ?');
   const retryThumb = db.prepare('UPDATE photos SET thumb = 0 WHERE id = ?');
+  const retryAi = db.prepare('UPDATE photos SET ai_state = 0 WHERE id = ?');
 
   let batch = [];
   const flush = () => {
@@ -107,7 +108,9 @@ export async function scanLibrary(db, shell, onProgress = () => {}) {
         } else if (!prev.cloud && cloud) {
           batch.push(() => nowCloud.run(prev.id));
         }
+        // Cloud previews that weren't available last time (e.g. offline): try again.
         if (prev.thumb === -2) batch.push(() => retryThumb.run(prev.id));
+        if (prev.ai_state === -2) batch.push(() => retryAi.run(prev.id));
       } else {
         // Never read a cloud-only file: that would download it. Use the file's date for now.
         const { taken, camera } = cloud ? {} : await readExif(file);

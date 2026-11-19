@@ -18,6 +18,19 @@ const E_PENDING = 'err 8004B205'; // the sync app is still fetching the preview
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Longest side of a PNG, read from its header (0 if unreadable). */
+function longSide(png) {
+  try {
+    const fd = fs.openSync(png, 'r');
+    const b = Buffer.alloc(24);
+    fs.readSync(fd, b, 0, 24, 0);
+    fs.closeSync(fd);
+    return Math.max(b.readUInt32BE(16), b.readUInt32BE(20));
+  } catch {
+    return 0;
+  }
+}
+
 class Helper {
   constructor() {
     this.queue = [];
@@ -137,6 +150,8 @@ export class Shell {
     fs.mkdirSync(path.dirname(outPng), { recursive: true });
     const h = this.pick();
     let r = await h.request(`T\t${size}\t${SIIGBF_INCACHEONLY | SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK}\t${file}\t${outPng}`);
+    // The cache may hold a smaller version (e.g. 480px from Explorer); ask for a proper one then.
+    if (r === 'ok' && longSide(outPng) < size * 0.9) r = 'too small';
     for (let tries = 0; r !== 'ok' && tries < 15; tries++) {
       r = await h.request(`T\t${size}\t${SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK}\t${file}\t${outPng}`);
       if (r === E_PENDING) await sleep(700);

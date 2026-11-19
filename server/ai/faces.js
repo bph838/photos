@@ -7,7 +7,10 @@ import { MODEL_DIR } from '../paths.js';
 const DET_SIZE = 640;
 const DET_THRESHOLD = 0.6;
 const NMS_THRESHOLD = 0.4;
-const MIN_FACE_PX = 36; // in the 1600px working image; smaller faces are background noise
+// Smaller faces are mostly background people. Relative to the image so it works the
+// same on full photos (36px at 1600px) and on OneDrive/iCloud previews (768px).
+const MIN_FACE_FRACTION = 0.0225;
+const MIN_FACE_PX = 20;
 
 // Where ArcFace expects the eyes, nose and mouth corners in its 112x112 input.
 const ARCFACE_DST = [
@@ -161,9 +164,8 @@ export function normalize(v) {
 
 /** Detect faces in an RGB image and return boxes (as fractions) with 512-d embeddings. */
 export async function findFaces(img) {
-  const boxes = (await detect(img)).filter(
-    (b) => Math.min(b.x2 - b.x1, b.y2 - b.y1) >= MIN_FACE_PX
-  );
+  const minSide = Math.max(MIN_FACE_PX, MIN_FACE_FRACTION * Math.max(img.width, img.height));
+  const boxes = (await detect(img)).filter((b) => Math.min(b.x2 - b.x1, b.y2 - b.y1) >= minSide);
   const faces = [];
   for (const b of boxes) {
     const input = alignedFace(img, b.kps);

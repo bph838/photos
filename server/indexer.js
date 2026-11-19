@@ -8,7 +8,7 @@ import sharp from 'sharp';
 import { openDb, toBlob, tx } from './db.js';
 import { log } from './paths.js';
 import { scanLibrary } from './scanner.js';
-import { makeThumb, makeCloudThumb, openImage, loadRgb } from './images.js';
+import { makeThumb, makeCloudThumb, openImage, loadRgb, loadCloudRgb } from './images.js';
 import { ClusterIndex } from './cluster.js';
 import { Shell } from './win/shell.js';
 
@@ -159,7 +159,10 @@ function petChance(clipEmb) {
 }
 
 async function analysePhoto(row) {
-  const img = await loadRgb(row.path, 1600);
+  // Cloud-only photos are checked using the OneDrive/iCloud preview (~768px), so nothing is
+  // downloaded. Tests showed faces in previews match the full photo almost exactly.
+  const img = row.cloud ? await loadCloudRgb(row.path, shell) : await loadRgb(row.path, 1600);
+  const minPet = Math.max(24, 0.03 * Math.max(img.width, img.height));
   const found = [];
   for (const f of await ai.faces.findFaces(img)) found.push({ kind: 'face', label: null, ...f });
 
@@ -170,7 +173,7 @@ async function analysePhoto(row) {
       const { xmin, ymin, xmax, ymax } = p.box;
       const x = Math.max(0, Math.floor(xmin)), y = Math.max(0, Math.floor(ymin));
       const w = Math.min(img.width - x, Math.ceil(xmax - xmin)), h = Math.min(img.height - y, Math.ceil(ymax - ymin));
-      if (w < 48 || h < 48) continue;
+      if (w < minPet || h < minPet) continue;
       const crop = await sharp(img.data, { raw: { width: img.width, height: img.height, channels: 3 } })
         .extract({ left: x, top: y, width: w, height: h })
         .raw()
@@ -183,10 +186,11 @@ async function analysePhoto(row) {
 }
 
 async function doAi() {
-  const total = db.prepare('SELECT COUNT(*) n FROM photos WHERE ai_state = 0 AND missing = 0 AND thumb = 1 AND cloud = 0').get().n;
+  const total = db.prepare('SELECT COUNT(*) n FROM photos WHERE ai_state = 0 AND missing = 0 AND thumb = 1').get().n;
   if (!total) return false;
   await loadAi();
-  const pick = db.prepare('SELECT id, path FROM photos WHERE ai_state = 0 AND missing = 0 AND thumb = 1 AND cloud = 0 ORDER BY taken DESC LIMIT 20');
+  const pick = db.prepare('SELECT id, path, cloud FROM photos WHERE ai_state = 0 AND missing = 0 AND thumb = 1 ORDER BY taken DESC LIMIT 20');
+  const setLater = db.prepare('UPDATE photos SET ai_state = -2 WHERE id = ?'); // retried on the next scan
   const insFace = db.prepare(
     'INSERT INTO faces (photo_id, kind, label, x, y, w, h, score, emb, cluster_id, person_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   );
@@ -204,7 +208,7 @@ async function doAi() {
         result = await analysePhoto(row);
       } catch (e) {
         log('AI failed for', row.path, e.message);
-        setFail.run(row.id);
+        (row.cloud ? setLater : setFail).run(row.id);
         continue;
       }
       tx(db, () => {

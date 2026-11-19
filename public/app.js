@@ -391,8 +391,9 @@ routes.folders = async () => {
       h('p', { style: { marginTop: 0 } }, st.indexer.message || ''),
       h('p', { class: 'meta', style: { color: 'var(--muted)' } }, `${plural(st.total, 'photo')} in total · ${st.analysed.toLocaleString()} checked for people and pets`),
       st.cloud ? h('p', { class: 'meta', style: { color: 'var(--muted)' } },
-        `☁ ${plural(st.cloud, 'photo')} ${st.cloud === 1 ? 'is' : 'are'} kept only in OneDrive or iCloud. They are shown using previews and are not downloaded. ` +
-        (st.cloudUnchecked ? `${st.cloudUnchecked.toLocaleString()} of them haven't been checked for people yet. Each one is checked once it has been opened (downloaded).` : '')) : null,
+        `☁ ${plural(st.cloud, 'photo')} ${st.cloud === 1 ? 'is' : 'are'} kept only in OneDrive or iCloud. ` +
+        'They are shown, and checked for people and pets, using previews, so they are not downloaded. ' +
+        (st.cloudUnchecked ? `${st.cloudUnchecked.toLocaleString()} still to check.` : '')) : null,
       h('button', { class: 'btn', html: `${icon('refresh')} Look for new photos now`, onclick: async () => { await api.post('/api/rescan'); toast('Looking for new photos...'); } })));
 };
 
@@ -524,8 +525,7 @@ async function showPhoto() {
   info.append(h('h3', {}, 'Taken'), h('div', { class: 'when' }, fmtLong(p.taken)));
 
   info.append(h('h3', {}, 'Who is in this photo'));
-  if (!p.analysed && p.cloud) info.append(h('p', { class: 'meta' }, `This photo is kept in ${where} and hasn't been downloaded, so it hasn't been checked for people yet. Opening it downloads it, and it will then be checked.`));
-  else if (!p.analysed) info.append(h('p', { class: 'meta' }, 'Not checked for people yet. This happens in the background.'));
+  if (!p.analysed) info.append(h('p', { class: 'meta' }, 'Not checked for people yet. This happens in the background.'));
   else if (!p.faces.length) info.append(h('p', { class: 'meta' }, 'No faces or pets were found.'));
   else {
     const who = h('div', { class: 'who' });
