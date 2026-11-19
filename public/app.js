@@ -739,7 +739,7 @@ async function pollStatus() {
     lastStatus = st;
     const s = st.indexer || {};
     $('#statusText').textContent = s.phase === 'idle' ? `✓ ${plural(st.total, 'photo')}, all up to date` : s.message || '';
-    const showBar = (s.phase === 'ai' || s.phase === 'thumbnails') && s.total;
+    const showBar = ['ai', 'thumbnails', 'downloading'].includes(s.phase) && s.total > 0;
     $('#statusBar').hidden = !showBar;
     if (showBar) $('#statusBar i').style.width = `${Math.round((100 * s.done) / s.total)}%`;
     // First photos just arrived: show them.

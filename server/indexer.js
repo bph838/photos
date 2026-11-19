@@ -106,14 +106,23 @@ async function doThumbs() {
 let ai = null;
 async function loadAi() {
   if (ai) return ai;
-  report({ phase: 'loading', message: 'Starting the face and pet finder...' });
+  const starting = () => report({ phase: 'loading', done: 0, total: 0, message: 'Starting the face and pet finder...' });
+  // While downloading, show MB and a progress bar; otherwise just a message.
+  const say = (message, p) =>
+    p ? report({ phase: 'downloading', done: p.done, total: p.total, message }) : report({ phase: 'loading', done: 0, total: 0, message });
+  starting();
   const { ensureFaceModels } = await import('./setup-models.js');
-  await ensureFaceModels((m) => report({ message: m }));
+  const { downloadTracker } = await import('./progress.js');
+  await ensureFaceModels(say);
+  starting();
   const faces = await import('./ai/faces.js');
   const clip = await import('./ai/clip.js');
   await faces.loadFaceModels(THREADS);
-  await clip.loadVision(THREADS);
-  await clip.loadText(1);
+  const searchProgress = downloadTracker('Downloading photo search model', say);
+  await clip.loadVision(THREADS, searchProgress);
+  await clip.loadText(1, searchProgress);
+  await clip.loadDetector(THREADS, downloadTracker('Downloading pet finder model', say));
+  starting();
   // Zero-shot "is there an animal in this photo?" check, so the slow pet
   // detector only runs on photos likely to contain one.
   const prompts = [
@@ -144,8 +153,6 @@ async function analysePhoto(row) {
   const clipEmb = await ai.clip.embedImage(img);
 
   if (petChance(clipEmb) > 0.12) {
-    const { loadDetector } = ai.clip;
-    await loadDetector(THREADS);
     for (const p of await ai.clip.detectPets(img)) {
       const { xmin, ymin, xmax, ymax } = p.box;
       const x = Math.max(0, Math.floor(xmin)), y = Math.max(0, Math.floor(ymin));

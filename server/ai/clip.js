@@ -21,22 +21,28 @@ env.allowRemoteModels = true;
 export const CLIP_ID = 'Xenova/clip-vit-base-patch32';
 export const DETR_ID = 'Xenova/detr-resnet-50';
 
-function sessionOptions(threads) {
-  return { dtype: 'q8', device: 'cpu', session_options: { intraOpNumThreads: threads, interOpNumThreads: 1 } };
+function sessionOptions(threads, onProgress) {
+  return {
+    dtype: 'q8',
+    device: 'cpu',
+    session_options: { intraOpNumThreads: threads, interOpNumThreads: 1 },
+    progress_callback: onProgress,
+  };
 }
 
 let vision, processor, text, tokenizer, detector;
 
-export async function loadVision(threads = 3) {
-  processor ??= await AutoProcessor.from_pretrained(CLIP_ID);
-  vision ??= await CLIPVisionModelWithProjection.from_pretrained(CLIP_ID, sessionOptions(threads));
+// onProgress (optional) receives transformers.js download events; see progress.js.
+export async function loadVision(threads = 3, onProgress) {
+  processor ??= await AutoProcessor.from_pretrained(CLIP_ID, { progress_callback: onProgress });
+  vision ??= await CLIPVisionModelWithProjection.from_pretrained(CLIP_ID, sessionOptions(threads, onProgress));
 }
-export async function loadText(threads = 2) {
-  tokenizer ??= await AutoTokenizer.from_pretrained(CLIP_ID);
-  text ??= await CLIPTextModelWithProjection.from_pretrained(CLIP_ID, sessionOptions(threads));
+export async function loadText(threads = 2, onProgress) {
+  tokenizer ??= await AutoTokenizer.from_pretrained(CLIP_ID, { progress_callback: onProgress });
+  text ??= await CLIPTextModelWithProjection.from_pretrained(CLIP_ID, sessionOptions(threads, onProgress));
 }
-export async function loadDetector(threads = 3) {
-  detector ??= await pipeline('object-detection', DETR_ID, sessionOptions(threads));
+export async function loadDetector(threads = 3, onProgress) {
+  detector ??= await pipeline('object-detection', DETR_ID, sessionOptions(threads, onProgress));
 }
 
 function toRaw(img) {
