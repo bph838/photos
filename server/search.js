@@ -95,7 +95,7 @@ export class Searcher {
     if (this.cache.has(key)) return this.cache.get(key);
 
     const p = this.parse(q);
-    const where = ['p.missing = 0', 'p.thumb >= 0'];
+    const where = ['p.missing = 0', 'p.thumb != -1'];
     const args = [];
     for (const person of p.persons) {
       where.push(`EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id AND f.person_id IN (${person.ids.map(() => '?').join(',')}))`);

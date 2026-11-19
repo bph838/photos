@@ -7,6 +7,7 @@ import { IMAGE_EXTS } from './images.js';
 import { thumbPath, cropPath, log } from './paths.js';
 import { tx } from './db.js';
 import { detachFromCluster } from './cluster.js';
+import { isCloudOnly } from './win/shell.js';
 
 const SKIP_DIRS = new Set(['$recycle.bin', 'system volume information', 'node_modules', '.git', '@eadir', '.thumbnails', 'appdata']);
 const MIN_BYTES = 15 * 1024; // ignore icons and tiny images
@@ -59,10 +60,10 @@ function forgetDerived(db, id) {
  * Scan every library folder. Calls onProgress({ found }) occasionally.
  * Returns { added, changed, missing }.
  */
-export async function scanLibrary(db, onProgress = () => {}) {
+export async function scanLibrary(db, shell, onProgress = () => {}) {
   const roots = db.prepare('SELECT path FROM folders').all().map((r) => r.path);
   const known = new Map();
-  for (const r of db.prepare('SELECT id, path, size, mtime, missing FROM photos').all()) known.set(r.path, r);
+  for (const r of db.prepare('SELECT id, path, size, mtime, missing, cloud, thumb FROM photos').all()) known.set(r.path, r);
 
   const seen = new Set();
   const reachableRoots = [];
@@ -70,12 +71,17 @@ export async function scanLibrary(db, onProgress = () => {}) {
   let changed = 0;
   let found = 0;
   const insert = db.prepare(
-    `INSERT INTO photos (path, folder, filename, size, mtime, taken, camera, added) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO photos (path, folder, filename, size, mtime, taken, camera, cloud, added) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   const update = db.prepare(
-    `UPDATE photos SET size = ?, mtime = ?, taken = ?, camera = ?, missing = 0, ai_state = 0, clip = NULL, thumb = 0, width = NULL, height = NULL WHERE id = ?`
+    `UPDATE photos SET size = ?, mtime = ?, taken = ?, camera = ?, cloud = ?, missing = 0, ai_state = 0, clip = NULL, thumb = 0, width = NULL, height = NULL WHERE id = ?`
   );
   const unmiss = db.prepare('UPDATE photos SET missing = 0 WHERE id = ?');
+  // Became local (opened, or "always keep on this device"): now we can read its real date.
+  const nowLocal = db.prepare('UPDATE photos SET cloud = 0, taken = COALESCE(?, taken), camera = COALESCE(?, camera) WHERE id = ?');
+  // Space freed up again: stay away from the file, keep everything we learned.
+  const nowCloud = db.prepare('UPDATE photos SET cloud = 1 WHERE id = ?');
+  const retryThumb = db.prepare('UPDATE photos SET thumb = 0 WHERE id = ?');
 
   let batch = [];
   const flush = () => {
@@ -85,6 +91,45 @@ export async function scanLibrary(db, onProgress = () => {}) {
     tx(db, () => work.forEach((fn) => fn()));
   };
 
+  // Files are handled in groups so cloud status can be asked for many at once.
+  const handle = async (group) => {
+    const attrs = shell ? await shell.attributes(group.map((g) => g.file)) : group.map(() => null);
+    for (let i = 0; i < group.length; i++) {
+      const { file, st } = group[i];
+      const cloud = isCloudOnly(attrs[i]) ? 1 : 0;
+      const prev = known.get(file);
+      const mtime = Math.round(st.mtimeMs);
+      if (prev && prev.size === st.size && prev.mtime === mtime) {
+        if (prev.missing) batch.push(() => unmiss.run(prev.id));
+        if (prev.cloud && !cloud) {
+          const { taken, camera } = await readExif(file);
+          batch.push(() => nowLocal.run(taken ?? null, camera ?? null, prev.id));
+        } else if (!prev.cloud && cloud) {
+          batch.push(() => nowCloud.run(prev.id));
+        }
+        if (prev.thumb === -2) batch.push(() => retryThumb.run(prev.id));
+      } else {
+        // Never read a cloud-only file: that would download it. Use the file's date for now.
+        const { taken, camera } = cloud ? {} : await readExif(file);
+        const when = taken ?? mtime;
+        if (prev) {
+          changed++;
+          batch.push(() => {
+            forgetDerived(db, prev.id);
+            update.run(st.size, mtime, when, camera ?? null, cloud, prev.id);
+          });
+        } else {
+          added++;
+          batch.push(() =>
+            insert.run(file, path.dirname(file), path.basename(file), st.size, mtime, when, camera ?? null, cloud, Date.now())
+          );
+        }
+      }
+    }
+    flush();
+  };
+
+  let group = [];
   for (const root of roots) {
     if (!fs.existsSync(root)) {
       log('Library folder not available (unplugged drive?):', root);
@@ -94,7 +139,7 @@ export async function scanLibrary(db, onProgress = () => {}) {
     for await (const file of walk(root)) {
       let st;
       try {
-        st = await fs.promises.stat(file);
+        st = await fs.promises.stat(file); // stat does not download cloud files
       } catch {
         continue;
       }
@@ -102,29 +147,14 @@ export async function scanLibrary(db, onProgress = () => {}) {
       seen.add(file);
       found++;
       if (found % 500 === 0) onProgress({ found });
-      const prev = known.get(file);
-      const mtime = Math.round(st.mtimeMs);
-      if (prev && prev.size === st.size && prev.mtime === mtime) {
-        if (prev.missing) batch.push(() => unmiss.run(prev.id));
-      } else {
-        const { taken, camera } = await readExif(file);
-        const when = taken ?? mtime;
-        if (prev) {
-          changed++;
-          batch.push(() => {
-            forgetDerived(db, prev.id);
-            update.run(st.size, mtime, when, camera ?? null, prev.id);
-          });
-        } else {
-          added++;
-          batch.push(() =>
-            insert.run(file, path.dirname(file), path.basename(file), st.size, mtime, when, camera ?? null, Date.now())
-          );
-        }
+      group.push({ file, st });
+      if (group.length >= 200) {
+        await handle(group);
+        group = [];
       }
-      if (batch.length >= 200) flush();
     }
   }
+  if (group.length) await handle(group);
   flush();
 
   // Photos we didn't see are marked missing (kept, so tags survive a drive being unplugged

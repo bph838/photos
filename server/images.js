@@ -39,6 +39,27 @@ export async function makeThumb(id, file) {
   return out;
 }
 
+/**
+ * Thumbnail for a cloud-only (OneDrive/iCloud) photo, from the preview Windows gives us,
+ * without downloading the photo. Returns { width, height } of the preview, or null.
+ */
+export async function makeCloudThumb(id, file, shell) {
+  const out = thumbPath(id);
+  fs.mkdirSync(path.dirname(out), { recursive: true });
+  const png = `${out}.${process.pid}.png`;
+  try {
+    if (!(await shell.thumbnail(file, png))) return null;
+    const img = sharp(png).removeAlpha();
+    const meta = await img.metadata();
+    const tmp = `${out}.${process.pid}.tmp`;
+    await img.resize(400, 400, { fit: 'inside', withoutEnlargement: true }).webp({ quality: 72 }).toFile(tmp);
+    fs.renameSync(tmp, out);
+    return { width: meta.width, height: meta.height };
+  } finally {
+    fs.rmSync(png, { force: true });
+  }
+}
+
 /** A large but browser-friendly version for the viewer (handles HEIC/TIFF too). */
 export async function makeDisplay(file, maxSide = 2400) {
   const img = await openImage(file);

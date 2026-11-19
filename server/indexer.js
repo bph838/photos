@@ -8,14 +8,17 @@ import sharp from 'sharp';
 import { openDb, toBlob, tx } from './db.js';
 import { log } from './paths.js';
 import { scanLibrary } from './scanner.js';
-import { makeThumb, openImage, loadRgb } from './images.js';
+import { makeThumb, makeCloudThumb, openImage, loadRgb } from './images.js';
 import { ClusterIndex } from './cluster.js';
+import { Shell } from './win/shell.js';
 
 const THREADS = Number(process.env.FAMILY_PHOTOS_THREADS || 3);
 const RESCAN_EVERY_MS = 30 * 60 * 1000;
 
 const db = openDb();
 const clusters = new ClusterIndex(db);
+// Cloud previews are mostly waiting on the network, so a few helpers run side by side.
+const shell = new Shell(3);
 const status = { phase: 'starting', done: 0, total: 0, message: '' };
 let scanRequested = true;
 let lastScan = 0;
@@ -67,7 +70,7 @@ function watchFolders() {
 async function doScan() {
   scanRequested = false;
   report({ phase: 'scanning', done: 0, total: 0, message: 'Looking for photos...' });
-  const res = await scanLibrary(db, ({ found }) => report({ message: `Looking for photos... ${found.toLocaleString()} found` }));
+  const res = await scanLibrary(db, shell, ({ found }) => report({ message: `Looking for photos... ${found.toLocaleString()} found` }));
   lastScan = Date.now();
   log('Scan finished', JSON.stringify(res));
   watchFolders();
@@ -77,14 +80,24 @@ async function doThumbs() {
   const total = db.prepare('SELECT COUNT(*) n FROM photos WHERE thumb = 0 AND missing = 0').get().n;
   if (!total) return false;
   let done = 0;
-  const pick = db.prepare('SELECT id, path FROM photos WHERE thumb = 0 AND missing = 0 ORDER BY taken DESC LIMIT 24');
+  const pick = db.prepare('SELECT id, path, cloud FROM photos WHERE thumb = 0 AND missing = 0 ORDER BY taken DESC LIMIT 24');
   const setOk = db.prepare('UPDATE photos SET thumb = 1, width = ?, height = ? WHERE id = ?');
-  const setBad = db.prepare('UPDATE photos SET thumb = -1 WHERE id = ?');
+  const setBad = db.prepare('UPDATE photos SET thumb = ? WHERE id = ?');
   while (!scanRequested) {
     const rows = pick.all();
     if (!rows.length) break;
     const results = await Promise.all(
       rows.map(async (r) => {
+        if (r.cloud) {
+          // Preview from OneDrive/iCloud via Windows; the photo itself stays in the cloud.
+          try {
+            const dims = await makeCloudThumb(r.id, r.path, shell);
+            if (dims) return { r, w: dims.width, h: dims.height };
+          } catch (e) {
+            log('No cloud preview for', r.path, e.message);
+          }
+          return { r, bad: -2 }; // try again on the next scan
+        }
         try {
           await makeThumb(r.id, r.path);
           const meta = await (await openImage(r.path)).metadata();
@@ -92,13 +105,14 @@ async function doThumbs() {
           return { r, w: swap ? meta.height : meta.width, h: swap ? meta.width : meta.height };
         } catch (e) {
           log('Cannot read photo', r.path, e.message);
-          return { r, bad: true };
+          return { r, bad: -1 };
         }
       })
     );
-    tx(db, () => results.forEach((x) => (x.bad ? setBad.run(x.r.id) : setOk.run(x.w, x.h, x.r.id))));
+    tx(db, () => results.forEach((x) => (x.bad ? setBad.run(x.bad, x.r.id) : setOk.run(x.w, x.h, x.r.id))));
     done += rows.length;
-    report({ phase: 'thumbnails', done, total, message: 'Preparing photos' });
+    const cloudLeft = rows.some((r) => r.cloud) ? ' (getting previews from OneDrive/iCloud)' : '';
+    report({ phase: 'thumbnails', done, total, message: `Preparing photos: ${done.toLocaleString()} of ${total.toLocaleString()}${cloudLeft}` });
   }
   return true;
 }
@@ -169,10 +183,10 @@ async function analysePhoto(row) {
 }
 
 async function doAi() {
-  const total = db.prepare('SELECT COUNT(*) n FROM photos WHERE ai_state = 0 AND missing = 0 AND thumb = 1').get().n;
+  const total = db.prepare('SELECT COUNT(*) n FROM photos WHERE ai_state = 0 AND missing = 0 AND thumb = 1 AND cloud = 0').get().n;
   if (!total) return false;
   await loadAi();
-  const pick = db.prepare('SELECT id, path FROM photos WHERE ai_state = 0 AND missing = 0 AND thumb = 1 ORDER BY taken DESC LIMIT 20');
+  const pick = db.prepare('SELECT id, path FROM photos WHERE ai_state = 0 AND missing = 0 AND thumb = 1 AND cloud = 0 ORDER BY taken DESC LIMIT 20');
   const insFace = db.prepare(
     'INSERT INTO faces (photo_id, kind, label, x, y, w, h, score, emb, cluster_id, person_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   );

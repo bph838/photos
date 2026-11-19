@@ -13,6 +13,7 @@ const ICONS = {
   eye: '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
   refresh: '<path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.5 9a9 9 0 0 1 14.9-3.4L23 10M1 14l4.6 4.4A9 9 0 0 0 20.5 15"/>',
   check: '<path d="M20 6L9 17l-5-5"/>',
+  cloud: '<path d="M18 10h-1.3A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/>',
 };
 const icon = (name) => `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] || ''}</svg>`;
 document.querySelectorAll('[data-icon]').forEach((el) => (el.innerHTML = icon(el.dataset.icon)));
@@ -70,6 +71,7 @@ const fmtLong = (t) =>
   ', ' + new Date(t).toLocaleTimeString(LOCALE, { hour: 'numeric', minute: '2-digit' });
 const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? '' : 's'}`;
 const thumbUrl = (id) => `/api/photo/${id}/thumb`;
+const cloudName = (p) => (/onedrive/i.test(p) ? 'OneDrive' : /icloud/i.test(p) ? 'iCloud' : 'the cloud');
 const cropUrl = (id) => `/api/face/${id}/crop`;
 
 // ---------------------------------------------------------------- photo grid
@@ -106,7 +108,8 @@ function photoGrid(container, query, { months = true, onTotal } = {}) {
         onkeydown: (e) => e.key === 'Enter' && openViewer(list, idx),
       },
       h('img', { src: thumbUrl(item.id), loading: 'lazy', alt: '', decoding: 'async' }),
-      item.fav ? h('span', { class: 'fav', html: icon('heart') }) : null
+      item.fav ? h('span', { class: 'fav', html: icon('heart') }) : null,
+      item.cloud ? h('span', { class: 'cloud', title: 'Kept in the cloud: downloaded when opened', html: icon('cloud') }) : null
     );
     tile.dataset.id = item.id;
     grid.append(tile);
@@ -387,6 +390,9 @@ routes.folders = async () => {
     h('div', { class: 'card' },
       h('p', { style: { marginTop: 0 } }, st.indexer.message || ''),
       h('p', { class: 'meta', style: { color: 'var(--muted)' } }, `${plural(st.total, 'photo')} in total · ${st.analysed.toLocaleString()} checked for people and pets`),
+      st.cloud ? h('p', { class: 'meta', style: { color: 'var(--muted)' } },
+        `☁ ${plural(st.cloud, 'photo')} ${st.cloud === 1 ? 'is' : 'are'} kept only in OneDrive or iCloud. They are shown using previews and are not downloaded. ` +
+        (st.cloudUnchecked ? `${st.cloudUnchecked.toLocaleString()} of them haven't been checked for people yet. Each one is checked once it has been opened (downloaded).` : '')) : null,
       h('button', { class: 'btn', html: `${icon('refresh')} Look for new photos now`, onclick: async () => { await api.post('/api/rescan'); toast('Looking for new photos...'); } })));
 };
 
@@ -475,8 +481,30 @@ async function showPhoto() {
   if (!vState || list.items[vState.index].id !== id) return;
   vState.photo = p;
 
-  const img = h('img', { src: `/api/photo/${id}/view`, alt: p.filename });
-  const frame = h('div', { class: `frame ${vState.showBoxes ? '' : 'hide-boxes'}` }, img);
+  // Show the small preview at once, then swap in the full photo when it arrives
+  // (for OneDrive/iCloud photos that's when the download finishes).
+  const where = cloudName(p.path);
+  const img = h('img', { src: thumbUrl(id), alt: p.filename, class: 'preview' });
+  const pill = h('div', { class: 'loading-pill', hidden: !p.cloud }, p.cloud ? `Getting this photo from ${where}…` : 'Loading…');
+  const slow = setTimeout(() => (pill.hidden = false), 700);
+  const full = new Image();
+  full.onload = () => {
+    clearTimeout(slow);
+    if (vState?.photo !== p) return;
+    img.src = full.src;
+    img.classList.remove('preview');
+    pill.remove();
+    fit();
+  };
+  full.onerror = () => {
+    clearTimeout(slow);
+    pill.hidden = false;
+    pill.textContent = p.cloud
+      ? `Couldn't get this photo from ${where}. Is the internet connected?`
+      : 'This photo could not be opened.';
+  };
+  full.src = `/api/photo/${id}/view`;
+  const frame = h('div', { class: `frame ${vState.showBoxes ? '' : 'hide-boxes'}` }, img, pill);
   for (const f of p.faces) {
     const label = f.name || (f.kind === 'pet' ? `Name this ${f.label || 'pet'}?` : 'Who is this?');
     frame.append(h('button', {
@@ -496,7 +524,8 @@ async function showPhoto() {
   info.append(h('h3', {}, 'Taken'), h('div', { class: 'when' }, fmtLong(p.taken)));
 
   info.append(h('h3', {}, 'Who is in this photo'));
-  if (!p.analysed) info.append(h('p', { class: 'meta' }, 'Not checked for people yet. This happens in the background.'));
+  if (!p.analysed && p.cloud) info.append(h('p', { class: 'meta' }, `This photo is kept in ${where} and hasn't been downloaded, so it hasn't been checked for people yet. Opening it downloads it, and it will then be checked.`));
+  else if (!p.analysed) info.append(h('p', { class: 'meta' }, 'Not checked for people yet. This happens in the background.'));
   else if (!p.faces.length) info.append(h('p', { class: 'meta' }, 'No faces or pets were found.'));
   else {
     const who = h('div', { class: 'who' });
@@ -520,6 +549,7 @@ async function showPhoto() {
   info.append(h('h3', {}, 'Where this photo is kept'));
   if (p.missing) info.append(h('p', { class: 'missing' }, 'This photo is no longer in its folder. It may have been moved, or its drive unplugged.'));
   info.append(h('div', { class: 'where', title: 'You can select and copy this' }, p.path));
+  if (p.cloud) info.append(h('p', { class: 'meta', style: { margin: '6px 0 0' } }, `☁ Stored in ${where}. A copy is downloaded when you open, copy or print it.`));
   const reveal = h('button', { class: 'btn', html: `${icon('folder')} Show in its folder` });
   reveal.onclick = () => api.post(`/api/photo/${id}/reveal`).then(() => toast('The folder has been opened. The photo is highlighted.'), fail);
   const openBtn = h('button', { class: 'btn', html: `${icon('open')} Open in another app` });
@@ -558,8 +588,9 @@ async function showPhoto() {
 
   // Fit the photo to the space (the face boxes are positioned relative to it).
   const fit = () => {
-    const nw = img.naturalWidth || p.w || 4;
-    const nh = img.naturalHeight || p.h || 3;
+    // Size by the real photo's shape (the preview is smaller but has the same shape).
+    const nw = p.w || img.naturalWidth || 4;
+    const nh = p.h || img.naturalHeight || 3;
     const r = Math.min((stage.clientWidth - 150) / nw, (stage.clientHeight - 40) / nh, 2);
     img.style.width = `${Math.max(50, nw * r)}px`;
     img.style.height = `${Math.max(50, nh * r)}px`;
@@ -570,7 +601,8 @@ async function showPhoto() {
 
   // Preload the next photo so arrows feel instant.
   const next = list.items[index + 1];
-  if (next) new Image().src = `/api/photo/${next.id}/view`;
+  // (Not for cloud photos: that would download a photo she hasn't asked to see.)
+  if (next && !next.cloud) new Image().src = `/api/photo/${next.id}/view`;
 }
 
 addEventListener('resize', () => vState?.fit?.());

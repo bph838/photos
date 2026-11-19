@@ -7,7 +7,8 @@ import { fork, spawn, execFile } from 'node:child_process';
 import express from 'express';
 import { openDb, fromBlob, tx } from './db.js';
 import { APP_ROOT, PORT, log, thumbPath } from './paths.js';
-import { makeThumb, makeDisplay, makeCrop, isHeic } from './images.js';
+import { makeThumb, makeCloudThumb, makeDisplay, makeCrop, isHeic } from './images.js';
+import { Shell } from './win/shell.js';
 import { detachFromCluster, personCentroid, unit, dot, SUGGEST_THRESHOLD } from './cluster.js';
 import { Searcher } from './search.js';
 
@@ -25,6 +26,7 @@ try {
 
 const db = openDb();
 const searcher = new Searcher(db);
+const shell = new Shell(2);
 
 // ---------- background indexer ----------
 let indexer = null;
@@ -120,7 +122,7 @@ function personSummary(p) {
 }
 
 function photoListSql(q) {
-  const where = ['p.missing = 0', 'p.thumb >= 0'];
+  const where = ['p.missing = 0', 'p.thumb != -1'];
   const args = [];
   if (q.person) {
     for (const id of String(q.person).split(',').map(Number).filter(Boolean)) {
@@ -168,10 +170,13 @@ app.get('/api/ping', (req, res) => res.json({ ok: true }));
 
 app.get('/api/status', (req, res) => {
   const c = db.prepare(
-    `SELECT COUNT(*) total, SUM(ai_state != 0) analysed, SUM(thumb = 1) thumbs FROM photos WHERE missing = 0`
+    `SELECT COUNT(*) total, SUM(ai_state != 0) analysed, SUM(thumb = 1) thumbs, SUM(cloud = 1) cloud, SUM(cloud = 1 AND ai_state = 0) cloudUnchecked FROM photos WHERE missing = 0`
   ).get();
   const folders = db.prepare('SELECT COUNT(*) n FROM folders').get().n;
-  res.json({ indexer: indexStatus, total: c.total, analysed: c.analysed || 0, thumbs: c.thumbs || 0, folders });
+  res.json({
+    indexer: indexStatus, total: c.total, analysed: c.analysed || 0, thumbs: c.thumbs || 0, folders,
+    cloud: c.cloud || 0, cloudUnchecked: c.cloudUnchecked || 0,
+  });
 });
 
 // ----- folders -----
@@ -220,7 +225,7 @@ app.get('/api/photos', asyncRoute(async (req, res) => {
   let ids;
   let total;
   let understood = null;
-  const cols = 'id, taken, width w, height h, favorite fav';
+  const cols = 'id, taken, width w, height h, favorite fav, cloud';
   if (req.query.q && String(req.query.q).trim()) {
     const r = await searcher.search(String(req.query.q).trim());
     understood = r.understood;
@@ -241,7 +246,7 @@ app.get('/api/years', (req, res) => {
   res.json(
     db.prepare(
       `SELECT strftime('%Y', taken / 1000, 'unixepoch', 'localtime') year, COUNT(*) count
-       FROM photos WHERE missing = 0 AND thumb >= 0 GROUP BY year ORDER BY year DESC`
+       FROM photos WHERE missing = 0 AND thumb != -1 GROUP BY year ORDER BY year DESC`
     ).all()
   );
 });
@@ -260,24 +265,40 @@ app.get('/api/photo/:id', (req, res) => {
   res.json({
     id: p.id, path: p.path, folder: p.folder, filename: p.filename, size: p.size, taken: p.taken,
     camera: p.camera, w: p.width, h: p.height, favorite: !!p.favorite, missing: !!p.missing,
-    analysed: p.ai_state !== 0, inPrint, faces,
+    analysed: p.ai_state !== 0, cloud: !!p.cloud, inPrint, faces,
   });
 });
 
 app.get('/api/photo/:id/thumb', asyncRoute(async (req, res) => {
   const p = photoById(Number(req.params.id));
   if (!p) return res.status(404).end();
-  let file = thumbPath(p.id);
+  const file = thumbPath(p.id);
   if (!fs.existsSync(file)) {
     try {
-      file = await makeThumb(p.id, p.path);
+      if (p.cloud) {
+        // Never read a cloud-only file here: ask Windows for OneDrive/iCloud's preview instead.
+        const dims = await makeCloudThumb(p.id, p.path, shell);
+        if (!dims) return sendNoPreview(res);
+        db.prepare('UPDATE photos SET thumb = 1, width = ?, height = ? WHERE id = ?').run(dims.width, dims.height, p.id);
+      } else {
+        await makeThumb(p.id, p.path);
+      }
     } catch {
-      return res.status(404).end();
+      return p.cloud ? sendNoPreview(res) : res.status(404).end();
     }
   }
   res.set('Cache-Control', 'private, max-age=604800');
   res.sendFile(file);
 }));
+
+// Shown for a cloud photo whose preview isn't available yet (e.g. offline).
+function sendNoPreview(res) {
+  res.set('Cache-Control', 'no-store');
+  res.type('svg').send(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 90"><rect width="120" height="90" fill="#d8d0c4"/>` +
+      `<path d="M44 58h34a12 12 0 0 0 0-24 16 16 0 0 0-30-4 13 13 0 0 0-4 28z" fill="#fff" opacity=".9"/></svg>`
+  );
+}
 
 app.get('/api/photo/:id/view', asyncRoute(async (req, res) => {
   const p = photoById(Number(req.params.id));
@@ -311,10 +332,11 @@ app.post('/api/photo/:id/open', (req, res) => {
 
 // ----- faces & pets -----
 app.get('/api/face/:id/crop', asyncRoute(async (req, res) => {
-  const f = db.prepare('SELECT f.*, p.path FROM faces f JOIN photos p ON p.id = f.photo_id WHERE f.id = ?').get(Number(req.params.id));
+  const f = db.prepare('SELECT f.*, p.path, p.cloud FROM faces f JOIN photos p ON p.id = f.photo_id WHERE f.id = ?').get(Number(req.params.id));
   if (!f) return res.status(404).end();
   try {
-    const file = await makeCrop(f, f.path);
+    // If the photo has gone back to cloud-only, crop from its preview so nothing is downloaded.
+    const file = await makeCrop(f, f.cloud ? thumbPath(f.photo_id) : f.path);
     res.set('Cache-Control', 'private, max-age=604800');
     res.sendFile(file);
   } catch {

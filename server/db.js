@@ -91,7 +91,17 @@ export function openDb() {
 
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
   `);
+  migrate(db);
   return db;
+}
+
+// Columns added after the first release. Each runs once on an older library.
+function migrate(db) {
+  const cols = new Set(db.prepare('PRAGMA table_info(photos)').all().map((c) => c.name));
+  if (!cols.has('cloud')) {
+    // 1 = only in OneDrive/iCloud (not downloaded): we must not read the file.
+    db.exec('ALTER TABLE photos ADD COLUMN cloud INTEGER NOT NULL DEFAULT 0');
+  }
 }
 
 export function toBlob(f32) {
