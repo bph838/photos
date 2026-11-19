@@ -1,0 +1,228 @@
+// Background worker (separate, low-priority process):
+//   1. scans the library folders for new / changed / removed photos
+//   2. makes thumbnails so the gallery is quick
+//   3. runs the AI: faces, pets, and CLIP "search by description"
+// It reports progress to the main server over IPC.
+import fs from 'node:fs';
+import sharp from 'sharp';
+import { openDb, toBlob, tx } from './db.js';
+import { log } from './paths.js';
+import { scanLibrary } from './scanner.js';
+import { makeThumb, openImage, loadRgb } from './images.js';
+import { ClusterIndex } from './cluster.js';
+
+const THREADS = Number(process.env.FAMILY_PHOTOS_THREADS || 3);
+const RESCAN_EVERY_MS = 30 * 60 * 1000;
+
+const db = openDb();
+const clusters = new ClusterIndex(db);
+const status = { phase: 'starting', done: 0, total: 0, message: '' };
+let scanRequested = true;
+let lastScan = 0;
+let wake = null;
+let watchers = [];
+
+function report(patch) {
+  Object.assign(status, patch);
+  process.send?.({ type: 'status', status });
+}
+
+process.on('message', (msg) => {
+  if (msg?.type === 'rescan') scanRequested = true;
+  if (msg?.type === 'clustersChanged') clusters.dirty = true;
+  wake?.();
+});
+process.on('disconnect', () => process.exit(0));
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    wake = () => {
+      clearTimeout(t);
+      resolve();
+    };
+  });
+}
+
+// Notice new photos arriving (e.g. copied off a phone) without waiting for the next full rescan.
+function watchFolders() {
+  for (const w of watchers) w.close();
+  watchers = [];
+  let timer;
+  for (const { path: root } of db.prepare('SELECT path FROM folders').all()) {
+    try {
+      const w = fs.watch(root, { recursive: true }, () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          scanRequested = true;
+          wake?.();
+        }, 15000);
+      });
+      w.on('error', () => {});
+      watchers.push(w);
+    } catch {}
+  }
+}
+
+async function doScan() {
+  scanRequested = false;
+  report({ phase: 'scanning', done: 0, total: 0, message: 'Looking for photos...' });
+  const res = await scanLibrary(db, ({ found }) => report({ message: `Looking for photos... ${found.toLocaleString()} found` }));
+  lastScan = Date.now();
+  log('Scan finished', JSON.stringify(res));
+  watchFolders();
+}
+
+async function doThumbs() {
+  const total = db.prepare('SELECT COUNT(*) n FROM photos WHERE thumb = 0 AND missing = 0').get().n;
+  if (!total) return false;
+  let done = 0;
+  const pick = db.prepare('SELECT id, path FROM photos WHERE thumb = 0 AND missing = 0 ORDER BY taken DESC LIMIT 24');
+  const setOk = db.prepare('UPDATE photos SET thumb = 1, width = ?, height = ? WHERE id = ?');
+  const setBad = db.prepare('UPDATE photos SET thumb = -1 WHERE id = ?');
+  while (!scanRequested) {
+    const rows = pick.all();
+    if (!rows.length) break;
+    const results = await Promise.all(
+      rows.map(async (r) => {
+        try {
+          await makeThumb(r.id, r.path);
+          const meta = await (await openImage(r.path)).metadata();
+          const swap = (meta.orientation || 1) >= 5;
+          return { r, w: swap ? meta.height : meta.width, h: swap ? meta.width : meta.height };
+        } catch (e) {
+          log('Cannot read photo', r.path, e.message);
+          return { r, bad: true };
+        }
+      })
+    );
+    tx(db, () => results.forEach((x) => (x.bad ? setBad.run(x.r.id) : setOk.run(x.w, x.h, x.r.id))));
+    done += rows.length;
+    report({ phase: 'thumbnails', done, total, message: 'Preparing photos' });
+  }
+  return true;
+}
+
+let ai = null;
+async function loadAi() {
+  if (ai) return ai;
+  report({ phase: 'loading', message: 'Starting the face and pet finder...' });
+  const { ensureFaceModels } = await import('./setup-models.js');
+  await ensureFaceModels((m) => report({ message: m }));
+  const faces = await import('./ai/faces.js');
+  const clip = await import('./ai/clip.js');
+  await faces.loadFaceModels(THREADS);
+  await clip.loadVision(THREADS);
+  await clip.loadText(1);
+  // Zero-shot "is there an animal in this photo?" check, so the slow pet
+  // detector only runs on photos likely to contain one.
+  const prompts = [
+    'a photo of a dog', 'a photo of a cat',
+    'a photo of people', 'a photo of a person', 'a photo of a landscape', 'a photo of food',
+    'a photo of a room', 'a photo of a building', 'a photo of a document', 'a photo of a car',
+    'a photo of flowers', 'a photo of a baby',
+  ];
+  const promptEmbs = [];
+  for (const p of prompts) promptEmbs.push(await clip.embedText(p));
+  ai = { faces, clip, promptEmbs };
+  return ai;
+}
+
+function petChance(clipEmb) {
+  const logits = ai.promptEmbs.map((p) => 100 * ai.clip.dot(clipEmb, p));
+  const m = Math.max(...logits);
+  const ex = logits.map((l) => Math.exp(l - m));
+  const sum = ex.reduce((a, b) => a + b, 0);
+  return (ex[0] + ex[1]) / sum;
+}
+
+async function analysePhoto(row) {
+  const img = await loadRgb(row.path, 1600);
+  const found = [];
+  for (const f of await ai.faces.findFaces(img)) found.push({ kind: 'face', label: null, ...f });
+
+  const clipEmb = await ai.clip.embedImage(img);
+
+  if (petChance(clipEmb) > 0.12) {
+    const { loadDetector } = ai.clip;
+    await loadDetector(THREADS);
+    for (const p of await ai.clip.detectPets(img)) {
+      const { xmin, ymin, xmax, ymax } = p.box;
+      const x = Math.max(0, Math.floor(xmin)), y = Math.max(0, Math.floor(ymin));
+      const w = Math.min(img.width - x, Math.ceil(xmax - xmin)), h = Math.min(img.height - y, Math.ceil(ymax - ymin));
+      if (w < 48 || h < 48) continue;
+      const crop = await sharp(img.data, { raw: { width: img.width, height: img.height, channels: 3 } })
+        .extract({ left: x, top: y, width: w, height: h })
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      const emb = await ai.clip.embedImage({ data: crop.data, width: crop.info.width, height: crop.info.height });
+      found.push({ kind: 'pet', label: p.label, x: x / img.width, y: y / img.height, w: w / img.width, h: h / img.height, score: p.score, emb });
+    }
+  }
+  return { clipEmb, found };
+}
+
+async function doAi() {
+  const total = db.prepare('SELECT COUNT(*) n FROM photos WHERE ai_state = 0 AND missing = 0 AND thumb = 1').get().n;
+  if (!total) return false;
+  await loadAi();
+  const pick = db.prepare('SELECT id, path FROM photos WHERE ai_state = 0 AND missing = 0 AND thumb = 1 ORDER BY taken DESC LIMIT 20');
+  const insFace = db.prepare(
+    'INSERT INTO faces (photo_id, kind, label, x, y, w, h, score, emb, cluster_id, person_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  );
+  const setDone = db.prepare('UPDATE photos SET ai_state = 1, clip = ? WHERE id = ?');
+  const setFail = db.prepare('UPDATE photos SET ai_state = -1 WHERE id = ?');
+  let done = 0;
+  const started = Date.now();
+  while (!scanRequested) {
+    const rows = pick.all();
+    if (!rows.length) break;
+    for (const row of rows) {
+      if (scanRequested) break;
+      let result;
+      try {
+        result = await analysePhoto(row);
+      } catch (e) {
+        log('AI failed for', row.path, e.message);
+        setFail.run(row.id);
+        continue;
+      }
+      tx(db, () => {
+        for (const f of result.found) {
+          const cl = clusters.assign(f.kind, f.emb);
+          insFace.run(row.id, f.kind, f.label, f.x, f.y, f.w, f.h, f.score, toBlob(f.emb), cl.id, cl.person_id ?? null);
+        }
+        setDone.run(toBlob(result.clipEmb), row.id);
+      });
+      done++;
+      const perPhoto = (Date.now() - started) / done;
+      const left = Math.round(((total - done) * perPhoto) / 60000);
+      report({
+        phase: 'ai',
+        done,
+        total,
+        message: `Finding people and pets: ${done.toLocaleString()} of ${total.toLocaleString()}` + (done > 20 ? ` (about ${left < 90 ? left + ' min' : Math.round(left / 60) + ' hours'} left)` : ''),
+      });
+    }
+  }
+  return true;
+}
+
+async function main() {
+  log('Indexer started');
+  for (;;) {
+    try {
+      if (scanRequested || Date.now() - lastScan > RESCAN_EVERY_MS) await doScan();
+      if (await doThumbs()) continue;
+      if (await doAi()) continue;
+      report({ phase: 'idle', done: 0, total: 0, message: 'All photos are up to date' });
+      await sleep(60000);
+    } catch (e) {
+      log('Indexer error', e);
+      report({ phase: 'error', message: 'Something went wrong while indexing; will retry shortly.' });
+      await sleep(30000);
+    }
+  }
+}
+
+main();

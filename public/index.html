@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Family Photos</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='2' y='4' width='20' height='16' rx='3' fill='%23c2410c'/%3E%3Ccircle cx='8.5' cy='10' r='2' fill='white'/%3E%3Cpath d='M4 18l5-5 3 3 3-4 5 6z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="3"/><circle cx="8.5" cy="10" r="2" class="hole"/><path d="M4 18l5-5 3 3 3-4 5 6z" class="hole"/></svg>
+      <span>Family Photos</span>
+    </div>
+    <nav>
+      <a href="#/photos" data-nav="photos"><span class="ico" data-icon="photos"></span>All photos</a>
+      <a href="#/people" data-nav="people"><span class="ico" data-icon="people"></span>People</a>
+      <a href="#/pets" data-nav="pets"><span class="ico" data-icon="paw"></span>Pets</a>
+      <a href="#/favourites" data-nav="favourites"><span class="ico" data-icon="heart"></span>Favourites</a>
+      <a href="#/print" data-nav="print"><span class="ico" data-icon="print"></span>Print list <b class="badge" id="printBadge" hidden></b></a>
+      <a href="#/folders" data-nav="folders"><span class="ico" data-icon="folder"></span>My folders</a>
+    </nav>
+    <div class="status" id="status" title="What the app is doing in the background">
+      <div class="status-text" id="statusText">Starting...</div>
+      <div class="bar" id="statusBar" hidden><i></i></div>
+    </div>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <form id="searchForm" class="search" role="search">
+        <span class="ico" data-icon="search"></span>
+        <input id="searchInput" type="search" autocomplete="off"
+          placeholder="Search: a name, a pet, a place, or things like “beach” or “birthday cake”" aria-label="Search photos">
+        <button type="button" id="searchClear" class="clear" aria-label="Clear search" hidden>&times;</button>
+      </form>
+    </header>
+    <section id="view" class="view" tabindex="-1"></section>
+  </main>
+
+  <div id="viewer" class="viewer" hidden></div>
+  <div id="modal" class="modal" hidden></div>
+  <div id="toast" class="toast" hidden></div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
