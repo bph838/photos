@@ -12,21 +12,57 @@ import { isCloudOnly } from './win/shell.js';
 const SKIP_DIRS = new Set(['$recycle.bin', 'system volume information', 'node_modules', '.git', '@eadir', '.thumbnails', 'appdata']);
 const MIN_BYTES = 15 * 1024; // ignore icons and tiny images
 
-async function* walk(dir) {
+// Files we don't mention when explaining what was skipped (Windows/camera clutter).
+const BORING = /^\.(ini|db|lnk|tmp|json|xml|txt|aae|xmp|thm|dat|log|url)$/;
+
+/**
+ * Yields every photo file under dir. `stats` collects what was seen so the app can explain
+ * what it is doing, and why something might not show up (folders it couldn't open, files
+ * that aren't photos...). `visited` stops linked folders from looping forever.
+ */
+async function* walk(dir, stats, visited = new Set()) {
+  try {
+    const real = (await fs.promises.realpath(dir)).toLowerCase();
+    if (visited.has(real)) return;
+    visited.add(real);
+  } catch {}
+  stats.folders++;
+  stats.current = dir;
+  stats.tick?.();
   let entries;
   try {
     entries = await fs.promises.readdir(dir, { withFileTypes: true });
   } catch (e) {
     log('Cannot read folder', dir, e.code || e.message);
+    stats.unreadable.push({ path: dir, why: e.code || e.message });
     return;
   }
   for (const ent of entries) {
     const full = path.join(dir, ent.name);
-    if (ent.isDirectory()) {
+    let isDir = ent.isDirectory();
+    let isFile = ent.isFile();
+    // Windows reports OneDrive/iCloud placeholders and junction folders as links ("reparse
+    // points"). Ask what they really are; stat doesn't download cloud files.
+    if (!isDir && !isFile) {
+      try {
+        const st = await fs.promises.stat(full);
+        isDir = st.isDirectory();
+        isFile = st.isFile();
+      } catch {
+        continue;
+      }
+    }
+    if (isDir) {
       if (ent.name.startsWith('.') || SKIP_DIRS.has(ent.name.toLowerCase())) continue;
-      yield* walk(full);
-    } else if (ent.isFile() && IMAGE_EXTS.has(path.extname(ent.name).toLowerCase())) {
-      yield full;
+      yield* walk(full, stats, visited);
+    } else if (isFile) {
+      stats.files++;
+      const ext = path.extname(ent.name).toLowerCase();
+      if (IMAGE_EXTS.has(ext)) yield full;
+      else if (!BORING.test(ext) && !ent.name.startsWith('~')) {
+        const k = ext || '(no extension)';
+        stats.other.set(k, (stats.other.get(k) || 0) + 1);
+      }
     }
   }
 }
@@ -57,10 +93,24 @@ function forgetDerived(db, id) {
 }
 
 /**
- * Scan every library folder. Calls onProgress({ found }) occasionally.
- * Returns { added, changed, missing }.
+ * Scan every library folder. Calls onProgress(stats) a few times a second.
+ * Returns { added, changed, missing, stats }.
  */
 export async function scanLibrary(db, shell, onProgress = () => {}) {
+  // step: 'looking' (walking folders), 'cloud' (asking Windows which files are cloud-only),
+  // 'dates' (reading dates from new photos), 'done'.
+  const stats = {
+    step: 'looking', current: '', folders: 0, files: 0, photos: 0, newPhotos: 0, tooSmall: 0,
+    other: new Map(), unreadable: [], unavailable: [], tick: null,
+  };
+  let lastTell = 0;
+  const tell = (force) => {
+    const now = Date.now();
+    if (!force && now - lastTell < 400) return;
+    lastTell = now;
+    onProgress(stats);
+  };
+  stats.tick = () => tell(false);
   const roots = db.prepare('SELECT path FROM folders').all().map((r) => r.path);
   const known = new Map();
   for (const r of db.prepare('SELECT id, path, size, mtime, missing, cloud, thumb, ai_state FROM photos').all()) known.set(r.path, r);
@@ -94,11 +144,16 @@ export async function scanLibrary(db, shell, onProgress = () => {}) {
 
   // Files are handled in groups so cloud status can be asked for many at once.
   const handle = async (group) => {
+    stats.step = 'cloud';
+    tell(true);
     const attrs = shell ? await shell.attributes(group.map((g) => g.file)) : group.map(() => null);
+    stats.step = 'dates';
     for (let i = 0; i < group.length; i++) {
       const { file, st } = group[i];
       const cloud = isCloudOnly(attrs[i]) ? 1 : 0;
       const prev = known.get(file);
+      stats.current = file;
+      tell(false);
       const mtime = Math.round(st.mtimeMs);
       if (prev && prev.size === st.size && prev.mtime === mtime) {
         if (prev.missing) batch.push(() => unmiss.run(prev.id));
@@ -123,6 +178,7 @@ export async function scanLibrary(db, shell, onProgress = () => {}) {
           });
         } else {
           added++;
+          stats.newPhotos++;
           batch.push(() =>
             insert.run(file, path.dirname(file), path.basename(file), st.size, mtime, when, camera ?? null, cloud, Date.now())
           );
@@ -130,26 +186,32 @@ export async function scanLibrary(db, shell, onProgress = () => {}) {
       }
     }
     flush();
+    stats.step = 'looking';
   };
 
   let group = [];
   for (const root of roots) {
     if (!fs.existsSync(root)) {
       log('Library folder not available (unplugged drive?):', root);
+      stats.unavailable.push(root);
       continue;
     }
     reachableRoots.push(root);
-    for await (const file of walk(root)) {
+    for await (const file of walk(root, stats)) {
       let st;
       try {
         st = await fs.promises.stat(file); // stat does not download cloud files
       } catch {
         continue;
       }
-      if (st.size < MIN_BYTES) continue;
+      if (st.size < MIN_BYTES) {
+        stats.tooSmall++; // icons and tiny images
+        continue;
+      }
       seen.add(file);
       found++;
-      if (found % 500 === 0) onProgress({ found });
+      stats.photos = found;
+      tell(false);
       group.push({ file, st });
       if (group.length >= 200) {
         await handle(group);
@@ -175,6 +237,8 @@ export async function scanLibrary(db, shell, onProgress = () => {}) {
       }
     }
   });
-  onProgress({ found });
-  return { added, changed, missing };
+  stats.step = 'done';
+  stats.current = '';
+  tell(true);
+  return { added, changed, missing, stats };
 }

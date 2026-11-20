@@ -67,12 +67,40 @@ function watchFolders() {
   }
 }
 
+// One friendly line for the sidebar while looking for photos.
+function scanMessage(s) {
+  const n = (x) => x.toLocaleString();
+  const found = `${n(s.photos)} photo${s.photos === 1 ? '' : 's'} found`;
+  if (s.step === 'cloud') return `Looking for photos... ${found}. Checking which are only in OneDrive/iCloud...`;
+  if (s.step === 'dates') return `Looking for photos... ${found}. Reading dates from new photos...`;
+  if (s.step === 'done') return `Finished looking: ${found} in ${n(s.folders)} folder${s.folders === 1 ? '' : 's'}`;
+  return `Looking for photos... ${found} so far (${n(s.folders)} folders, ${n(s.files)} files checked)`;
+}
+
+// The details, for the "My folders" page: where it is now, and anything worth explaining.
+function scanDetail(s) {
+  return {
+    step: s.step,
+    current: s.current,
+    folders: s.folders,
+    files: s.files,
+    photos: s.photos,
+    newPhotos: s.newPhotos,
+    tooSmall: s.tooSmall,
+    other: [...s.other].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([ext, count]) => ({ ext, count })),
+    otherTotal: [...s.other.values()].reduce((a, b) => a + b, 0),
+    unreadable: s.unreadable.slice(0, 10),
+    unreadableTotal: s.unreadable.length,
+    unavailable: s.unavailable,
+  };
+}
+
 async function doScan() {
   scanRequested = false;
-  report({ phase: 'scanning', done: 0, total: 0, message: 'Looking for photos...' });
-  const res = await scanLibrary(db, shell, ({ found }) => report({ message: `Looking for photos... ${found.toLocaleString()} found` }));
+  report({ phase: 'scanning', done: 0, total: 0, message: 'Looking for photos...', scan: null });
+  const res = await scanLibrary(db, shell, (s) => report({ message: scanMessage(s), scan: scanDetail(s) }));
   lastScan = Date.now();
-  log('Scan finished', JSON.stringify(res));
+  log('Scan finished', JSON.stringify({ ...res, stats: scanDetail(res.stats) }));
   watchFolders();
 }
 

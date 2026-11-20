@@ -556,29 +556,109 @@ async function fixFaces(p, area) {
 }
 
 routes.folders = async () => {
+  const gen = renderGen;
   const folders = await api.get('/api/folders');
-  const st = await api.get('/api/status');
   view.append(h('h1', {}, 'My folders'), h('p', { class: 'sub' }, 'The app shows photos from these folders (and all folders inside them). It only ever reads your photos. It never moves, changes or deletes them.'));
+  const counts = {};
   for (const f of folders) {
+    counts[f.id] = h('small', {}, f.available ? plural(f.count, 'photo') : 'Not available right now (is a drive unplugged?)');
     view.append(h('div', { class: 'card folder' },
       h('span', { html: icon('folder') }),
-      h('div', { class: 'path' }, f.path, h('small', {}, f.available ? plural(f.count, 'photo') : 'Not available right now (is a drive unplugged?)')),
+      h('div', { class: 'path' }, f.path, counts[f.id]),
       h('button', { class: 'btn small danger', onclick: async () => {
         if (!confirm(`Stop showing photos from this folder?\n\n${f.path}\n\n(The photos themselves are not touched.)`)) return;
         await api.del(`/api/folders/${f.id}`);
         render();
       } }, 'Remove')));
   }
-  view.append(addFolderControls(), h('h2', {}, 'Background work'),
-    h('div', { class: 'card' },
-      h('p', { style: { marginTop: 0 } }, st.indexer.message || ''),
-      h('p', { class: 'meta', style: { color: 'var(--muted)' } }, `${plural(st.total, 'photo')} in total · ${st.analysed.toLocaleString()} checked for people and pets`),
-      st.cloud ? h('p', { class: 'meta', style: { color: 'var(--muted)' } },
-        `☁ ${plural(st.cloud, 'photo')} ${st.cloud === 1 ? 'is' : 'are'} kept only in OneDrive or iCloud. ` +
-        'They are shown, and checked for people and pets, using previews, so they are not downloaded. ' +
-        (st.cloudUnchecked ? `${st.cloudUnchecked.toLocaleString()} still to check.` : '')) : null,
-      h('button', { class: 'btn', html: `${icon('refresh')} Look for new photos now`, onclick: async () => { await api.post('/api/rescan'); toast('Looking for new photos...'); } })));
+  const work = h('div', { class: 'card work' });
+  view.append(addFolderControls(), h('h2', {}, 'Background work'), work);
+
+  // Keep the card up to date while this page is open.
+  let wasScanning = false;
+  const refresh = async () => {
+    if (gen !== renderGen) return;
+    try {
+      const st = await api.get('/api/status');
+      if (gen !== renderGen) return;
+      const scanning = st.indexer?.phase === 'scanning';
+      work.replaceChildren(...workCard(st));
+      // Photo counts per folder change as photos are found.
+      if (scanning || wasScanning) {
+        for (const f of await api.get('/api/folders')) {
+          if (counts[f.id]) counts[f.id].textContent = f.available ? plural(f.count, 'photo') : 'Not available right now (is a drive unplugged?)';
+        }
+      }
+      wasScanning = scanning;
+    } catch {}
+    setTimeout(refresh, 1500);
+  };
+  refresh();
 };
+
+// File types people often have in their photo folders that the app can't show (yet).
+const KIND_OF = {
+  '.mp4': 'video', '.mov': 'video', '.avi': 'video', '.3gp': 'video', '.m4v': 'video', '.mts': 'video', '.wmv': 'video', '.mpg': 'video', '.mpeg': 'video', '.mkv': 'video',
+  '.nef': 'raw', '.cr2': 'raw', '.cr3': 'raw', '.arw': 'raw', '.dng': 'raw', '.orf': 'raw', '.rw2': 'raw', '.raf': 'raw', '.pef': 'raw', '.srw': 'raw',
+  '.bmp': 'image', '.psd': 'image', '.svg': 'image', '.ico': 'image', '.jfif': 'image',
+};
+
+function workCard(st) {
+  const s = st.indexer || {};
+  const d = s.scan;
+  const muted = (...kids) => h('p', { class: 'meta', style: { color: 'var(--muted)' } }, ...kids);
+  const out = [h('p', { style: { marginTop: 0, fontWeight: 600 } }, s.phase === 'idle' ? '✓ All photos are up to date' : s.message || '')];
+
+  if (d) {
+    const n = (x) => x.toLocaleString();
+    if (s.phase === 'scanning' && d.current) {
+      out.push(muted(d.step === 'looking' ? 'Looking in: ' : 'Now: ', h('span', { class: 'where-line' }, d.current)));
+    }
+    const done = d.step === 'done';
+    out.push(muted(
+      `${done ? 'Last look' : 'So far'}: ${plural(d.folders, 'folder')} and ${plural(d.files, 'file')} checked, ` +
+      `${plural(d.photos, 'photo')} found` + (d.newPhotos ? ` (${n(d.newPhotos)} new)` : '') + '.'
+    ));
+
+    // Things that explain why photos might be missing.
+    const notes = [];
+    if (d.unavailable?.length) notes.push(h('li', {}, `Can't reach: ${d.unavailable.join(', ')}. Is a drive unplugged?`));
+    if (d.unreadableTotal) {
+      notes.push(h('li', {},
+        `${plural(d.unreadableTotal, 'folder')} couldn't be opened (Windows said no, usually because of permissions):`,
+        h('ul', {}, d.unreadable.map((u) => h('li', { class: 'where-line' }, u.path))),
+        d.unreadableTotal > d.unreadable.length ? muted(`...and ${n(d.unreadableTotal - d.unreadable.length)} more.`) : null));
+    }
+    if (d.tooSmall) notes.push(h('li', {}, `${plural(d.tooSmall, 'tiny image')} skipped (icons and thumbnails, under 15 KB).`));
+    if (d.otherTotal) {
+      const by = { video: 0, raw: 0, image: 0, other: 0 };
+      for (const o of d.other) by[KIND_OF[o.ext] || 'other'] += o.count;
+      const parts = [];
+      if (by.video) parts.push(`${n(by.video)} video${by.video === 1 ? '' : 's'} (not shown yet)`);
+      if (by.raw) parts.push(`${n(by.raw)} camera RAW file${by.raw === 1 ? '' : 's'} (not supported yet)`);
+      if (by.image) parts.push(`${n(by.image)} other picture file${by.image === 1 ? '' : 's'}`);
+      notes.push(h('li', {},
+        `${plural(d.otherTotal, 'file')} that aren't photos the app can show` + (parts.length ? `, including ${parts.join(', ')}` : '') + '. ',
+        h('span', { style: { color: 'var(--muted)' } }, 'Most common: ' + d.other.map((o) => `${o.ext} (${n(o.count)})`).join(', '))));
+    }
+    if (done && !d.photos && d.folders) {
+      notes.unshift(h('li', { style: { fontWeight: 600 } },
+        d.files ? 'No photos were found. None of the files in these folders are JPG, PNG, HEIC, WebP, GIF or TIFF photos.'
+          : 'No photos were found: the folders are empty, or the app was not allowed to look inside them.'));
+    }
+    if (notes.length) out.push(h('ul', { class: 'notes' }, notes));
+  }
+
+  out.push(muted(`${plural(st.total, 'photo')} in total · ${st.analysed.toLocaleString()} checked for people and pets`));
+  if (st.cloud) {
+    out.push(muted(
+      `☁ ${plural(st.cloud, 'photo')} ${st.cloud === 1 ? 'is' : 'are'} kept only in OneDrive or iCloud. ` +
+      'They are shown, and checked for people and pets, using previews, so they are not downloaded. ' +
+      (st.cloudUnchecked ? `${st.cloudUnchecked.toLocaleString()} still to check.` : '')));
+  }
+  out.push(h('button', { class: 'btn', html: `${icon('refresh')} Look for new photos now`, onclick: async () => { await api.post('/api/rescan'); toast('Looking for new photos...'); } }));
+  return out;
+}
 
 function addFolderControls(big) {
   const input = h('input', { type: 'text', placeholder: 'or type a folder, e.g. D:\\Photos', 'aria-label': 'Folder path' });

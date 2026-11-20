@@ -286,3 +286,10 @@ h2 { font-size: 21px; margin: 28px 0 12px; }
   .view { padding: 16px 16px 60px; }
   .topbar { padding: 12px 16px; }
 }
+
+/* ---------- background work details (My folders) ---------- */
+.work .meta { margin: 6px 0; }
+.where-line { word-break: break-all; font-family: Consolas, "Cascadia Mono", monospace; font-size: 14px; }
+.notes { margin: 10px 0; padding-left: 22px; font-size: 15px; }
+.notes li { margin: 6px 0; }
+.notes ul { padding-left: 18px; margin: 4px 0; }
