@@ -68,6 +68,37 @@ async function* walk(dir, stats, visited = new Set()) {
 }
 
 const EXIF_TIMEOUT_MS = 20000;
+const EXIF_HEAD = 512 * 1024; // camera info sits at the start of a JPEG
+const EXIF_WHOLE_MAX = 40 * 1024 * 1024;
+
+/** Reads `length` bytes from the start of a file (or all of it), always closing it again. */
+async function readHead(file, length) {
+  const fh = await fs.promises.open(file, 'r');
+  try {
+    const size = (await fh.stat()).size;
+    const buf = Buffer.alloc(Math.min(size, length));
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    return { buf: buf.subarray(0, bytesRead), size };
+  } finally {
+    await fh.close();
+  }
+}
+
+const EXIF_OPTIONS = {
+  pick: ['DateTimeOriginal', 'CreateDate', 'DateTimeDigitized', 'Make', 'Model'],
+  reviveValues: true,
+};
+
+// We hand exifr the bytes rather than the file name. When exifr opens files itself it calls
+// fileHandle.stat() wrongly and never closes the file; on Node 26 that error leaves an open
+// file behind, and Node then kills the whole background process when it tidies it up.
+async function parseExif(file) {
+  const { buf, size } = await readHead(file, EXIF_HEAD);
+  const x = await exifr.parse(buf, EXIF_OPTIONS).catch(() => null);
+  if (x || size <= buf.length || size > EXIF_WHOLE_MAX || !/\.(heic|heif|tiff?)$/i.test(file)) return x;
+  // HEIC/TIFF can keep the camera info further in: read the whole photo.
+  return exifr.parse((await readHead(file, size)).buf, EXIF_OPTIONS).catch(() => null);
+}
 
 async function readExif(file) {
   let timer;
@@ -75,10 +106,7 @@ async function readExif(file) {
     // A file that is secretly still in the cloud (or on a sleepy network drive) can take
     // ages to read. Don't let one photo hold up the whole scan: use its file date instead.
     const x = await Promise.race([
-      exifr.parse(file, {
-        pick: ['DateTimeOriginal', 'CreateDate', 'DateTimeDigitized', 'Make', 'Model'],
-        reviveValues: true,
-      }),
+      parseExif(file),
       new Promise((_, reject) => (timer = setTimeout(() => reject(new Error('timed out')), EXIF_TIMEOUT_MS))),
     ]);
     if (!x) return {};
@@ -88,6 +116,7 @@ async function readExif(file) {
     return { taken, camera };
   } catch (e) {
     if (e?.message === 'timed out') log(`Reading the date took over ${EXIF_TIMEOUT_MS / 1000}s, skipped:`, file);
+    else log('Could not read the date from', file, '-', e?.message);
     return {};
   } finally {
     clearTimeout(timer);

@@ -17,7 +17,8 @@ export const CROP_DIR = path.join(base, 'crops');
 export const MODEL_DIR = path.join(base, 'models');
 export const LOG_PATH = path.join(base, 'log.txt');
 // Photos that froze or crashed the indexer while being read; their dates come from the file instead.
-export const SKIP_PATH = path.join(base, 'skip-files.json');
+// (-2: the first list filled up with good photos because of the Node 26 crash, so it's ignored.)
+export const SKIP_PATH = path.join(base, 'skip-files-2.json');
 export const PORT = Number(process.env.FAMILY_PHOTOS_PORT || 4321);
 
 for (const d of [DATA_DIR, THUMB_DIR, CROP_DIR, MODEL_DIR]) fs.mkdirSync(d, { recursive: true });

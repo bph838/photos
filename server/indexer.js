@@ -15,6 +15,14 @@ import { Shell } from './win/shell.js';
 const THREADS = Number(process.env.FAMILY_PHOTOS_THREADS || 3);
 const RESCAN_EVERY_MS = 30 * 60 * 1000;
 
+// Put the reason for a crash in the log (otherwise it only goes to a console nobody sees).
+for (const ev of ['uncaughtException', 'unhandledRejection']) {
+  process.on(ev, (e) => {
+    log(`Background work crashed (${ev}):`, e instanceof Error ? e : String(e));
+    process.exit(1);
+  });
+}
+
 const db = openDb();
 const clusters = new ClusterIndex(db);
 // Cloud previews are mostly waiting on the network, so a few helpers run side by side.

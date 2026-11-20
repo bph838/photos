@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fork, spawn, execFile } from 'node:child_process';
+import readline from 'node:readline';
 import express from 'express';
 import { openDb, fromBlob, tx } from './db.js';
 import { APP_ROOT, PORT, LOG_PATH, log, logTail, thumbPath, cropPath, addToSkipList } from './paths.js';
@@ -34,7 +35,9 @@ let indexStatus = { phase: 'starting', message: 'Starting...' };
 let lastHeard = 0;
 let opening = null; // the photo the indexer is reading right now, while looking for photos
 function startIndexer() {
-  indexer = fork(path.join(APP_ROOT, 'server', 'indexer.js'), [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
+  indexer = fork(path.join(APP_ROOT, 'server', 'indexer.js'), [], { stdio: ['ignore', 'inherit', 'pipe', 'ipc'] });
+  // Anything the indexer prints as an error (e.g. Node's own crash report) goes in the log too.
+  readline.createInterface({ input: indexer.stderr }).on('line', (l) => l.trim() && log('[background error output]', l));
   lastHeard = Date.now();
   opening = null;
   try {
