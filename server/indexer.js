@@ -4,6 +4,7 @@
 //   3. runs the AI: faces, pets, and CLIP "search by description"
 // It reports progress to the main server over IPC.
 import fs from 'node:fs';
+import os from 'node:os';
 import sharp from 'sharp';
 import { openDb, toBlob, tx } from './db.js';
 import { log } from './paths.js';
@@ -73,9 +74,11 @@ function watchFolders() {
   let timer;
   for (const { path: root } of db.prepare('SELECT path FROM folders').all()) {
     try {
-      const w = fs.watch(root, { recursive: true }, () => {
+      const w = fs.watch(root, { recursive: true }, (ev, name) => {
+        if (!timer) log(`Change noticed in your folders (${ev}: ${name || '?'}); will look for new photos in 15s`);
         clearTimeout(timer);
         timer = setTimeout(() => {
+          timer = null;
           scanRequested = true;
           wake?.();
         }, 15000);
@@ -140,48 +143,104 @@ async function doScan() {
     (file) => process.send?.({ type: 'opening', file })
   );
   lastScan = Date.now();
-  log('Scan finished', JSON.stringify({ ...res, stats: scanDetail(res.stats) }));
+  const d = scanDetail(res.stats);
+  const cloud = db.prepare('SELECT COUNT(*) n FROM photos WHERE missing = 0 AND cloud = 1').get().n;
+  log(
+    `Scan finished: ${d.photos} photos (${cloud} only in OneDrive/iCloud) in ${d.folders} folders; ` +
+      `${res.added} new, ${res.changed} changed, ${res.missing} gone. ${d.tooSmall} tiny images skipped; ` +
+      `${d.otherTotal} other files (${d.other.map((o) => `${o.ext} ${o.count}`).join(', ') || 'none'})` +
+      (d.unreadableTotal ? `; ${d.unreadableTotal} folders could not be opened` : '') +
+      (d.unavailable.length ? `; not reachable: ${d.unavailable.join(', ')}` : '')
+  );
+  const attrs = [...res.stats.attrs].sort((a, b) => b[1].n - a[1].n).slice(0, 12);
+  if (attrs.length) {
+    log('Windows file attributes seen (count, and whether that means cloud-only):',
+      attrs.map(([k, v]) => `${k}: ${v.n}${v.cloud ? ' cloud' : ''}`).join(', '));
+  }
   watchFolders();
 }
 
 async function doThumbs() {
   const total = db.prepare('SELECT COUNT(*) n FROM photos WHERE thumb = 0 AND missing = 0').get().n;
   if (!total) return false;
-  let done = 0;
-  const pick = db.prepare('SELECT id, path, cloud FROM photos WHERE thumb = 0 AND missing = 0 ORDER BY taken DESC LIMIT 24');
+  const cloudTotal = db.prepare('SELECT COUNT(*) n FROM photos WHERE thumb = 0 AND missing = 0 AND cloud = 1').get().n;
+  log(`Preparing ${total} photos: ${total - cloudTotal} on this PC, ${cloudTotal} only in OneDrive/iCloud (those come last, they are slower)`);
+  // Photos on this PC first (quick), then cloud-only ones (each waits on Windows / the sync app).
+  const pick = db.prepare('SELECT id, path, cloud FROM photos WHERE thumb = 0 AND missing = 0 ORDER BY cloud, taken DESC LIMIT 300');
   const setOk = db.prepare('UPDATE photos SET thumb = 1, width = ?, height = ? WHERE id = ?');
   const setBad = db.prepare('UPDATE photos SET thumb = ? WHERE id = ?');
+  const WORKERS = Math.max(4, os.cpus().length);
+  const started = Date.now();
+  const st = { done: 0, cloud: 0, cloudMs: 0, local: 0, localMs: 0, failed: 0, slowest: 0, slowestFile: '' };
+  let pending = [];
+  const save = () => {
+    const work = pending;
+    pending = [];
+    tx(db, () => work.forEach((x) => (x.bad ? setBad.run(x.bad, x.r.id) : setOk.run(x.w, x.h, x.r.id))));
+  };
+
+  async function one(r) {
+    const t0 = Date.now();
+    let res;
+    if (r.cloud) {
+      // Preview from OneDrive/iCloud via Windows; the photo itself stays in the cloud.
+      try {
+        const dims = await makeCloudThumb(r.id, r.path, shell);
+        res = dims ? { r, w: dims.width, h: dims.height } : { r, bad: -2 };
+      } catch (e) {
+        log('No cloud preview for', r.path, e.message);
+        res = { r, bad: -2 }; // try again on the next scan
+      }
+    } else {
+      try {
+        await makeThumb(r.id, r.path);
+        const meta = await (await openImage(r.path)).metadata();
+        const swap = (meta.orientation || 1) >= 5;
+        res = { r, w: swap ? meta.height : meta.width, h: swap ? meta.width : meta.height };
+      } catch (e) {
+        log('Cannot read photo', r.path, e.message);
+        res = { r, bad: -1 };
+      }
+    }
+    const ms = Date.now() - t0;
+    if (r.cloud) (st.cloud++, (st.cloudMs += ms));
+    else (st.local++, (st.localMs += ms));
+    if (res.bad) st.failed++;
+    if (ms > st.slowest) (st.slowest = ms), (st.slowestFile = r.path);
+    pending.push(res);
+    st.done++;
+    if (pending.length >= 50) save();
+    const secs = (Date.now() - started) / 1000;
+    const perMin = secs > 20 ? Math.round((st.done / secs) * 60) : 0;
+    const left = perMin ? Math.round((total - st.done) / perMin) : 0;
+    const eta = !perMin ? '' : left < 90 ? `, about ${left} min left` : `, about ${(left / 60).toFixed(left < 600 ? 1 : 0)} hours left`;
+    const where = r.cloud ? ' (getting previews from OneDrive/iCloud)' : '';
+    report({
+      phase: 'thumbnails', done: st.done, total,
+      message: `Preparing photos: ${st.done.toLocaleString()} of ${total.toLocaleString()}${perMin ? ` (${perMin.toLocaleString()} a minute${eta})` : ''}${where}`,
+    });
+  }
+
+  // A steady pool of workers: one slow photo no longer holds up the others.
+  let lastLog = Date.now();
   while (!scanRequested) {
     const rows = pick.all();
     if (!rows.length) break;
-    const results = await Promise.all(
-      rows.map(async (r) => {
-        if (r.cloud) {
-          // Preview from OneDrive/iCloud via Windows; the photo itself stays in the cloud.
-          try {
-            const dims = await makeCloudThumb(r.id, r.path, shell);
-            if (dims) return { r, w: dims.width, h: dims.height };
-          } catch (e) {
-            log('No cloud preview for', r.path, e.message);
-          }
-          return { r, bad: -2 }; // try again on the next scan
-        }
-        try {
-          await makeThumb(r.id, r.path);
-          const meta = await (await openImage(r.path)).metadata();
-          const swap = (meta.orientation || 1) >= 5;
-          return { r, w: swap ? meta.height : meta.width, h: swap ? meta.width : meta.height };
-        } catch (e) {
-          log('Cannot read photo', r.path, e.message);
-          return { r, bad: -1 };
-        }
+    let next = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(WORKERS, rows.length) }, async () => {
+        while (next < rows.length && !scanRequested) await one(rows[next++]);
       })
     );
-    tx(db, () => results.forEach((x) => (x.bad ? setBad.run(x.bad, x.r.id) : setOk.run(x.w, x.h, x.r.id))));
-    done += rows.length;
-    const cloudLeft = rows.some((r) => r.cloud) ? ' (getting previews from OneDrive/iCloud)' : '';
-    report({ phase: 'thumbnails', done, total, message: `Preparing photos: ${done.toLocaleString()} of ${total.toLocaleString()}${cloudLeft}` });
+    save();
+    if (Date.now() - lastLog > 60000 || !pick.all().length) {
+      lastLog = Date.now();
+      const avg = (n, ms) => (n ? `${n} in ${(ms / n / 1000).toFixed(2)}s each` : 'none');
+      log(`Thumbnail timings so far - on this PC: ${avg(st.local, st.localMs)}; from OneDrive/iCloud: ${avg(st.cloud, st.cloudMs)}; ` +
+        `failed: ${st.failed}; slowest ${(st.slowest / 1000).toFixed(1)}s (${st.slowestFile})`);
+    }
   }
+  save();
   return true;
 }
 

@@ -68,7 +68,8 @@ async function* walk(dir, stats, visited = new Set()) {
 }
 
 const EXIF_TIMEOUT_MS = 20000;
-const EXIF_HEAD = 512 * 1024; // camera info sits at the start of a JPEG
+const EXIF_FIRST = 64 * 1024; // camera info sits at the start of a JPEG
+const EXIF_HEAD = 512 * 1024;
 const EXIF_WHOLE_MAX = 40 * 1024 * 1024;
 
 /** Reads `length` bytes from the start of a file (or all of it), always closing it again. */
@@ -93,8 +94,13 @@ const EXIF_OPTIONS = {
 // fileHandle.stat() wrongly and never closes the file; on Node 26 that error leaves an open
 // file behind, and Node then kills the whole background process when it tidies it up.
 async function parseExif(file) {
-  const { buf, size } = await readHead(file, EXIF_HEAD);
-  const x = await exifr.parse(buf, EXIF_OPTIONS).catch(() => null);
+  // Usually the camera info is in the first 64 KB; only read more when it isn't.
+  let { buf, size } = await readHead(file, EXIF_FIRST);
+  let x = await exifr.parse(buf, EXIF_OPTIONS).catch(() => null);
+  if (!x && size > buf.length) {
+    ({ buf, size } = await readHead(file, EXIF_HEAD));
+    x = await exifr.parse(buf, EXIF_OPTIONS).catch(() => null);
+  }
   if (x || size <= buf.length || size > EXIF_WHOLE_MAX || !/\.(heic|heif|tiff?)$/i.test(file)) return x;
   // HEIC/TIFF can keep the camera info further in: read the whole photo.
   return exifr.parse((await readHead(file, size)).buf, EXIF_OPTIONS).catch(() => null);
@@ -143,6 +149,7 @@ export async function scanLibrary(db, shell, onProgress = () => {}, onOpen = () 
     step: 'looking', current: '', folders: 0, files: 0, photos: 0, newPhotos: 0, tooSmall: 0,
     other: new Map(), unreadable: [], unavailable: [], tick: null,
     // What it is busy with right now, so a slow step shows "waiting on X for 40s" rather than looking frozen.
+    attrs: new Map(),
     stepSince: Date.now(), waitingOn: '', waitingSince: 0, batchDone: 0, batchSize: 0, batches: 0,
   };
   const setStep = (step) => {
@@ -217,10 +224,14 @@ export async function scanLibrary(db, shell, onProgress = () => {}, onOpen = () 
       const unknown = attrs.filter((a) => a == null).length;
       if (shell?.enabled && unknown) log(`Cloud status unknown for ${unknown} of ${group.length} files (treated as on this PC)`);
       setStep('dates');
-      log(`Scan: ${stats.photos} photos found in ${stats.folders} folders; checking batch ${stats.batches} (${group.length} files) in`, path.dirname(group[0].file));
       for (let i = 0; i < group.length; i++) {
         const { file, st } = group[i];
         const cloud = isCloudOnly(attrs[i]) ? 1 : 0;
+        // Tally the Windows attributes seen, so the log shows how cloud status was decided.
+        const key = attrs[i] == null ? 'unknown' : '0x' + attrs[i].toString(16);
+        const a = stats.attrs.get(key) || { n: 0, cloud };
+        a.n++;
+        stats.attrs.set(key, a);
         const prev = known.get(file);
         stats.current = file;
         stats.batchDone = i;
@@ -260,7 +271,9 @@ export async function scanLibrary(db, shell, onProgress = () => {}, onOpen = () 
       }
       stats.batchDone = group.length;
       stats.waitingOn = '';
-      log(`Batch ${stats.batches} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (${stats.newPhotos} new photos so far)`);
+      // Only slow batches are worth a line in the log (progress is logged every 15s anyway).
+      const took = (Date.now() - t0) / 1000;
+      if (took > 5) log(`Batch of ${group.length} photos took ${took.toFixed(1)}s, in`, path.dirname(group[0].file));
       flush();
       setStep('looking');
     };

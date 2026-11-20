@@ -7,9 +7,16 @@ import fs from 'node:fs';
 import readline from 'node:readline';
 import { APP_ROOT, log } from '../paths.js';
 
-// FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | RECALL_ON_OPEN | OFFLINE: reading it would download it.
-const CLOUD_BITS = 0x400000 | 0x40000 | 0x1000;
-export const isCloudOnly = (attrs) => attrs != null && attrs >= 0 && (attrs & CLOUD_BITS) !== 0;
+// Is this file only in the cloud (reading it would download it)?
+// OneDrive and iCloud placeholders set RECALL_ON_DATA_ACCESS (0x400000). We don't look at
+// RECALL_ON_OPEN (0x40000): it has the same value as FILE_ATTRIBUTE_EA, which Windows 11 puts
+// on plenty of ordinary files on the hard drive, so they were wrongly treated as cloud-only.
+// OFFLINE (0x1000) only counts on a reparse point (0x400), i.e. a cloud placeholder.
+const RECALL_ON_DATA_ACCESS = 0x400000;
+const OFFLINE = 0x1000;
+const REPARSE_POINT = 0x400;
+export const isCloudOnly = (attrs) =>
+  attrs != null && attrs >= 0 && ((attrs & RECALL_ON_DATA_ACCESS) !== 0 || ((attrs & OFFLINE) !== 0 && (attrs & REPARSE_POINT) !== 0));
 
 const SIIGBF_BIGGERSIZEOK = 0x1;
 const SIIGBF_THUMBNAILONLY = 0x8;
