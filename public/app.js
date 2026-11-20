@@ -75,11 +75,17 @@ const cloudName = (p) => (/onedrive/i.test(p) ? 'OneDrive' : /icloud/i.test(p) ?
 const cropUrl = (id) => `/api/face/${id}/crop`;
 
 // ---------------------------------------------------------------- photo grid
-// Loads photos page by page as you scroll; optionally grouped under month headings.
+// Loads photos page by page as you scroll; optionally grouped under month headings,
+// with a timeline down the right-hand side for jumping through the years.
 let renderGen = 0;
+const ymOf = (t) => {
+  if (t == null) return 'none';
+  const d = new Date(t);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+};
 function photoGrid(container, query, { months = true, onTotal } = {}) {
   const gen = renderGen;
-  const list = { items: [], total: null, done: false, loading: false, load };
+  const list = { items: [], total: null, done: false, loading: null, load, loadUntil, anchors: {} };
   let grid = null;
   let monthKey = null;
   const sentinel = h('div', { class: 'more' });
@@ -87,10 +93,14 @@ function photoGrid(container, query, { months = true, onTotal } = {}) {
 
   function addTile(item, idx) {
     if (months) {
-      const key = fmtMonth(item.taken);
+      const key = ymOf(item.taken);
       if (key !== monthKey) {
         monthKey = key;
-        sentinel.before(h('div', { class: 'month' }, key));
+        // A zero-height, non-sticky marker so the timeline can find where each month starts
+        // (the heading itself is sticky, so its position can't be trusted).
+        const anchor = h('div', { class: 'month-anchor' });
+        list.anchors[key] = anchor;
+        sentinel.before(anchor, h('div', { class: 'month' }, item.taken == null ? 'No date' : fmtMonth(item.taken)));
         grid = null;
       }
     }
@@ -115,29 +125,202 @@ function photoGrid(container, query, { months = true, onTotal } = {}) {
     grid.append(tile);
   }
 
-  async function load() {
-    if (list.loading || list.done) return;
-    list.loading = true;
-    try {
-      const params = new URLSearchParams({ ...query, offset: list.items.length, limit: 200 });
-      const r = await api.get(`/api/photos?${params}`);
-      if (gen !== renderGen) return;
-      list.total = r.total;
-      onTotal?.(r);
-      for (const it of r.items) addTile(it, list.items.push(it) - 1);
-      list.done = list.items.length >= r.total || !r.items.length;
-    } catch (e) {
-      fail(e);
-      list.done = true;
-    } finally {
-      list.loading = false;
-    }
-    if (!list.done && sentinel.getBoundingClientRect().top < innerHeight * 2) load();
+  // Returns a promise for the page being fetched, so callers can wait for it.
+  function load(limit = 200) {
+    if (list.loading) return list.loading;
+    if (list.done) return Promise.resolve();
+    list.loading = (async () => {
+      try {
+        const params = new URLSearchParams({ ...query, offset: list.items.length, limit });
+        const r = await api.get(`/api/photos?${params}`);
+        if (gen !== renderGen) { list.done = true; return; }
+        list.total = r.total;
+        onTotal?.(r);
+        for (const it of r.items) addTile(it, list.items.push(it) - 1);
+        list.done = list.items.length >= r.total || !r.items.length;
+      } catch (e) {
+        fail(e);
+        list.done = true;
+      } finally {
+        list.loading = null;
+      }
+      if (!list.done && sentinel.getBoundingClientRect().top < innerHeight * 2) load();
+    })();
+    return list.loading;
+  }
+  // Keep loading until at least n photos are on the page (used when jumping far down the timeline).
+  async function loadUntil(n) {
+    while (!list.done && list.items.length < n && gen === renderGen) await load(500);
   }
   const io = new IntersectionObserver((es) => es.some((e) => e.isIntersecting) && load(), { rootMargin: '1200px' });
   io.observe(sentinel);
   load();
+  if (months && view.contains(container)) timeline(list, query, gen);
   return list;
+}
+
+// ---------------------------------------------------------------- timeline
+// A strip down the right edge, like the Windows Photos app: years marked along it, the
+// current position shown as you scroll, and hover / click / drag to jump to any month.
+const tlEl = $('#timeline');
+let tlAbort = null;
+function hideTimeline() {
+  tlAbort?.abort();
+  tlAbort = null;
+  tlEl.hidden = true;
+  tlEl.classList.remove('hovering');
+  tlEl.replaceChildren();
+  view.classList.remove('has-timeline');
+}
+async function timeline(list, query, gen) {
+  hideTimeline();
+  const ac = new AbortController();
+  tlAbort = ac;
+  const on = (el, type, fn, opts = {}) => el.addEventListener(type, fn, { ...opts, signal: ac.signal });
+  let months;
+  try {
+    months = await api.get(`/api/months?${new URLSearchParams(query)}`);
+  } catch {
+    return;
+  }
+  if (ac.signal.aborted || gen !== renderGen || months.length < 2) return;
+
+  const key = (m) => m.ym || 'none';
+  const total = months.reduce((n, m) => n + m.count, 0);
+  let start = 0;
+  for (const m of months) { m.start = start; start += m.count; }
+  const manyYears = new Set(months.map((m) => key(m).slice(0, 4))).size > 1;
+  const monthDate = (m) => new Date(+m.ym.slice(0, 4), +m.ym.slice(5) - 1, 1);
+  const label = (m) => (m.ym ? monthDate(m).toLocaleDateString(LOCALE, { month: 'long', year: 'numeric' }) : 'No date');
+  // Layout: every year (or every month, when only one year is shown) gets a minimum slot so
+  // its label always fits; the rest of the height is shared out by how many photos there are.
+  const groupOf = (m) => (manyYears ? key(m).slice(0, 4) : key(m));
+  const MIN_SLOT = 26;
+  function layout(H) {
+    const groups = new Map();
+    for (const m of months) groups.set(groupOf(m), (groups.get(groupOf(m)) || 0) + 1);
+    const slot = Math.min(MIN_SLOT, H / groups.size);
+    const spare = Math.max(0, H - groups.size * slot);
+    let y = 0;
+    for (const m of months) {
+      m.y = y;
+      m.h = slot / groups.get(groupOf(m)) + (m.count / total) * spare;
+      y += m.h;
+    }
+  }
+  const monthAt = (y) => {
+    let lo = 0, hi = months.length - 1;
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (months[mid].y <= y) lo = mid; else hi = mid - 1; }
+    return months[lo];
+  };
+
+  const track = h('div', { class: 'tl-track' });
+  const marker = h('div', { class: 'tl-marker' });
+  const hover = h('div', { class: 'tl-hover' });
+  const tip = h('div', { class: 'tl-tip' });
+  tlEl.replaceChildren(track, marker, hover, tip);
+  tlEl.hidden = false;
+  view.classList.add('has-timeline');
+
+  // Year labels (or month labels when only one year is showing), with a dot for each month between.
+  function drawLabels() {
+    track.replaceChildren();
+    layout(track.clientHeight);
+    const labelYs = [];
+    let prev = null;
+    for (const m of months) {
+      const g = groupOf(m);
+      if (g === prev) continue;
+      prev = g;
+      const text = !m.ym ? '?' : manyYears ? g : monthDate(m).toLocaleDateString(LOCALE, { month: 'short' });
+      track.append(h('div', { class: 'tl-label', style: { top: `${m.y}px` } }, text));
+      labelYs.push(m.y);
+    }
+    let lastDot = -Infinity;
+    prev = null;
+    for (const m of months) {
+      const g = groupOf(m);
+      const first = g !== prev;
+      prev = g;
+      if (first) continue;
+      const near = labelYs.some((ly) => Math.abs(ly - m.y) < 12);
+      if (near || m.y - lastDot < 7) continue;
+      track.append(h('div', { class: 'tl-dot', style: { top: `${m.y}px` } }));
+      lastDot = m.y;
+    }
+  }
+
+  // Where are we? Find the month at the top of the view and how far through it we've scrolled.
+  function updateMarker() {
+    const top = view.getBoundingClientRect().top + 60;
+    let pos = 0;
+    for (let i = 0; i < months.length; i++) {
+      const a = list.anchors[key(months[i])];
+      if (!a) break;
+      const y = a.getBoundingClientRect().top;
+      if (y > top) break;
+      const next = months[i + 1] && list.anchors[key(months[i + 1])];
+      // For the last month, "the end" is where our reading line sits once fully scrolled down.
+      const ny = next ? next.getBoundingClientRect().top
+        : list.done ? top + (view.scrollHeight - view.clientHeight - view.scrollTop) : null;
+      const within = ny && ny > y ? Math.min(1, (top - y) / (ny - y)) : 0;
+      pos = months[i].y + within * months[i].h;
+    }
+    marker.style.top = `${pos}px`;
+  }
+
+  let jumpTo = null;
+  async function jump(m) {
+    jumpTo = m;
+    await list.loadUntil(m.start + 1);
+    if (ac.signal.aborted || jumpTo !== m) return; // a newer jump has taken over
+    const a = list.anchors[key(m)];
+    if (a) view.scrollTop += a.getBoundingClientRect().top - view.getBoundingClientRect().top - 4;
+  }
+
+  function showTip(e) {
+    const r = track.getBoundingClientRect();
+    const y = Math.min(r.height - 0.5, Math.max(0, e.clientY - r.top));
+    hover.style.top = tip.style.top = `${y}px`;
+    const m = monthAt(y);
+    tip.textContent = label(m);
+    tlEl.classList.add('hovering');
+    return m;
+  }
+
+  let dragging = false;
+  let target = null;
+  on(tlEl, 'pointermove', (e) => {
+    const m = showTip(e);
+    if (dragging && m !== target) {
+      target = m;
+      if (list.anchors[key(m)]) jump(m); // scrub live through months already on the page
+    }
+  });
+  on(tlEl, 'pointerleave', () => !dragging && tlEl.classList.remove('hovering'));
+  on(tlEl, 'pointerdown', (e) => {
+    dragging = true;
+    tlEl.setPointerCapture(e.pointerId);
+    target = showTip(e);
+    jump(target);
+    e.preventDefault();
+  });
+  const endDrag = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    if (target) jump(target);
+    const r = tlEl.getBoundingClientRect();
+    const inside = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+    if (!inside || e.type === 'pointercancel') tlEl.classList.remove('hovering');
+  };
+  on(tlEl, 'pointerup', endDrag);
+  on(tlEl, 'pointercancel', endDrag);
+
+  let raf = 0;
+  on(view, 'scroll', () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(updateMarker); }, { passive: true });
+  const ro = new ResizeObserver(() => { drawLabels(); updateMarker(); });
+  ro.observe(track);
+  ac.signal.addEventListener('abort', () => { ro.disconnect(); cancelAnimationFrame(raf); });
 }
 
 // ---------------------------------------------------------------- routing
@@ -156,6 +339,7 @@ async function render() {
     $('#searchInput').value = '';
     $('#searchClear').hidden = true;
   }
+  hideTimeline();
   view.replaceChildren();
   view.scrollTop = 0;
   try {
@@ -174,10 +358,9 @@ routes.photos = async ({ params }) => {
   const st = lastStatus || (await api.get('/api/status'));
   if (!st.folders) return renderWelcome();
   const years = await api.get('/api/years');
+  // Years are picked from the timeline on the right now, so no year chips here.
   view.append(h('h1', {}, params.year ? `Photos from ${params.year}` : 'All photos'));
-  const chips = h('div', { class: 'chips' }, h('a', { class: `chip ${params.year ? '' : 'on'}`, href: '#/photos' }, 'All years'));
-  for (const y of years) if (y.year) chips.append(h('a', { class: `chip ${params.year === y.year ? 'on' : ''}`, href: `#/photos?year=${y.year}`, title: plural(y.count, 'photo') }, y.year));
-  view.append(chips);
+  if (params.year) view.append(h('div', { class: 'chips' }, h('a', { class: 'chip', href: '#/photos' }, '← All years')));
   if (!years.length) {
     view.append(h('div', { class: 'empty' }, h('span', { class: 'big' }, '⏳'), 'Looking for your photos. They will appear here in a moment...'));
     return;

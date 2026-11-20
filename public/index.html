@@ -36,7 +36,10 @@
         <button type="button" id="searchClear" class="clear" aria-label="Clear search" hidden>&times;</button>
       </form>
     </header>
-    <section id="view" class="view" tabindex="-1"></section>
+    <div class="view-wrap">
+      <section id="view" class="view" tabindex="-1"></section>
+      <div id="timeline" class="timeline" hidden aria-label="Timeline: click or drag to jump to a date"></div>
+    </div>
   </main>
 
   <div id="viewer" class="viewer" hidden></div>

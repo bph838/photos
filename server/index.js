@@ -242,6 +242,17 @@ app.get('/api/photos', asyncRoute(async (req, res) => {
   res.json({ total, items });
 }));
 
+// Photo counts per month, newest first, in the same order as /api/photos — drives the timeline.
+app.get('/api/months', (req, res) => {
+  const { where, args } = photoListSql(req.query);
+  res.json(
+    db.prepare(
+      `SELECT strftime('%Y-%m', taken / 1000, 'unixepoch', 'localtime') ym, COUNT(*) count
+       FROM photos p WHERE ${where} GROUP BY ym ORDER BY ym DESC`
+    ).all(...args)
+  );
+});
+
 app.get('/api/years', (req, res) => {
   res.json(
     db.prepare(
