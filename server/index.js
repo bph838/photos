@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fork, spawn, execFile } from 'node:child_process';
 import express from 'express';
 import { openDb, fromBlob, tx } from './db.js';
-import { APP_ROOT, PORT, log, thumbPath, cropPath } from './paths.js';
+import { APP_ROOT, PORT, LOG_PATH, log, logTail, thumbPath, cropPath, addToSkipList } from './paths.js';
 import { makeThumb, makeCloudThumb, makeDisplay, makeCrop, isHeic } from './images.js';
 import { Shell } from './win/shell.js';
 import { detachFromCluster, personCentroid, unit, dot, SUGGEST_THRESHOLD } from './cluster.js';
@@ -31,23 +31,44 @@ const shell = new Shell(2);
 // ---------- background indexer ----------
 let indexer = null;
 let indexStatus = { phase: 'starting', message: 'Starting...' };
+let lastHeard = 0;
+let opening = null; // the photo the indexer is reading right now, while looking for photos
 function startIndexer() {
   indexer = fork(path.join(APP_ROOT, 'server', 'indexer.js'), [], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
+  lastHeard = Date.now();
+  opening = null;
   try {
     os.setPriority(indexer.pid, os.constants.priority.PRIORITY_BELOW_NORMAL);
   } catch {}
   indexer.on('message', (m) => {
+    if (m?.type === 'opening') opening = m.file;
     if (m?.type === 'status') {
       indexStatus = m.status;
+      lastHeard = Date.now();
       if (m.status.phase === 'idle') searcher.clearCache();
     }
   });
-  indexer.on('exit', (code) => {
-    log('Indexer exited with code', code);
+  indexer.on('exit', (code, signal) => {
+    log('Indexer exited with code', code, signal || '');
+    // Crashed while reading a photo: don't open that photo again, or it would crash every time.
+    const file = indexStatus.phase === 'scanning' && opening;
+    if ((code || signal) && file) {
+      log('Will not read this photo again (it stopped the indexer):', file);
+      addToSkipList(file);
+    }
     indexer = null;
+    indexStatus = { phase: 'starting', message: 'Restarting the background work...' };
     setTimeout(startIndexer, 10000);
   });
 }
+// While looking for photos the indexer reports every 2 seconds. If it goes quiet it has
+// frozen (e.g. on a damaged photo or a stuck drive): restart it, skipping that photo.
+setInterval(() => {
+  if (!indexer || indexStatus.phase !== 'scanning' || Date.now() - lastHeard < 60000) return;
+  log('Indexer stopped responding while on', opening || indexStatus.scan?.current || '(unknown)');
+  lastHeard = Date.now();
+  indexer.kill(); // the exit handler records the photo and restarts
+}, 10000).unref();
 const tellIndexer = (type) => indexer?.send({ type });
 const clustersChanged = () => {
   searcher.clearCache();
@@ -177,6 +198,16 @@ app.get('/api/status', (req, res) => {
     indexer: indexStatus, total: c.total, analysed: c.analysed || 0, thumbs: c.thumbs || 0, folders,
     cloud: c.cloud || 0, cloudUnchecked: c.cloudUnchecked || 0,
   });
+});
+
+// ----- log (shown on the My folders page, and easy to share when asking for help) -----
+app.get('/api/log', (req, res) => {
+  res.json({ lines: logTail(Math.min(400, Number(req.query.lines) || 40)), path: LOG_PATH });
+});
+app.post('/api/log/show', (req, res) => {
+  if (!fs.existsSync(LOG_PATH)) log('Log opened');
+  explorer(`/select,"${LOG_PATH}"`);
+  res.json({ ok: true });
 });
 
 // ----- folders -----
@@ -627,6 +658,13 @@ app.use((err, req, res, next) => {
 // ---------- start ----------
 const server = app.listen(PORT, '127.0.0.1', () => {
   log(`Family Photos running at ${URL_BASE}`);
+  // Basic facts about this PC, so a shared log makes sense on its own.
+  const folders = db.prepare('SELECT path FROM folders').all().map((r) => r.path);
+  const photos = db.prepare('SELECT COUNT(*) n FROM photos WHERE missing = 0').get().n;
+  log(
+    `Windows ${os.release()}, Node ${process.version}, ${os.cpus().length} CPUs, ${Math.round(os.totalmem() / 2 ** 30)} GB memory.`,
+    `${photos} photos known. Folders: ${folders.join(' ; ') || '(none yet)'}`
+  );
   startIndexer();
   if (!NO_BROWSER) openBrowser();
 });

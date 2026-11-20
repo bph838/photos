@@ -25,9 +25,20 @@ let lastScan = 0;
 let wake = null;
 let watchers = [];
 
+// Progress also goes in the log (on every change of phase, and every 15s), so a log shared
+// for help shows what the app was doing and how fast, not just the errors.
+let loggedPhase = '';
+let loggedAt = 0;
 function report(patch) {
   Object.assign(status, patch);
   process.send?.({ type: 'status', status });
+  const now = Date.now();
+  if (status.phase !== loggedPhase || now - loggedAt > 15000) {
+    loggedPhase = status.phase;
+    loggedAt = now;
+    const where = status.phase === 'scanning' && status.scan?.current ? ` | now: ${status.scan.current}` : '';
+    log(`Status (${status.phase}): ${status.message}${where}`);
+  }
 }
 
 process.on('message', (msg) => {
@@ -69,7 +80,7 @@ function watchFolders() {
 
 // One friendly line for the sidebar while looking for photos.
 const secsSince = (t) => Math.max(0, Math.round((Date.now() - t) / 1000));
-const fileName = (p) => p.split(/[\/]/).pop();
+const fileName = (p) => p.split(/[\\/]/).pop();
 function scanMessage(s) {
   const n = (x) => x.toLocaleString();
   const found = `${n(s.photos)} photo${s.photos === 1 ? '' : 's'} found`;
@@ -114,7 +125,12 @@ function scanDetail(s) {
 async function doScan() {
   scanRequested = false;
   report({ phase: 'scanning', done: 0, total: 0, message: 'Looking for photos...', scan: null });
-  const res = await scanLibrary(db, shell, (s) => report({ message: scanMessage(s), scan: scanDetail(s) }));
+  const res = await scanLibrary(
+    db,
+    shell,
+    (s) => report({ message: scanMessage(s), scan: scanDetail(s) }),
+    (file) => process.send?.({ type: 'opening', file })
+  );
   lastScan = Date.now();
   log('Scan finished', JSON.stringify({ ...res, stats: scanDetail(res.stats) }));
   watchFolders();

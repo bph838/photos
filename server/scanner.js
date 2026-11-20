@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import exifr from 'exifr';
 import { IMAGE_EXTS } from './images.js';
-import { thumbPath, cropPath, log } from './paths.js';
+import { thumbPath, cropPath, log, readSkipList } from './paths.js';
 import { tx } from './db.js';
 import { detachFromCluster } from './cluster.js';
 import { isCloudOnly } from './win/shell.js';
@@ -107,7 +107,7 @@ function forgetDerived(db, id) {
  * Scan every library folder. Calls onProgress(stats) a few times a second.
  * Returns { added, changed, missing, stats }.
  */
-export async function scanLibrary(db, shell, onProgress = () => {}) {
+export async function scanLibrary(db, shell, onProgress = () => {}, onOpen = () => {}) {
   // step: 'looking' (walking folders), 'cloud' (asking Windows which files are cloud-only),
   // 'dates' (reading dates from new photos), 'done'.
   const stats = {
@@ -138,6 +138,13 @@ export async function scanLibrary(db, shell, onProgress = () => {}) {
 
   async function scanInner() {
     const roots = db.prepare('SELECT path FROM folders').all().map((r) => r.path);
+    const skip = readSkipList();
+    // Say which file we're about to open (so if it freezes or crashes us, it can be skipped next time).
+    const exifOf = (file) => {
+      if (skip.has(file)) return {};
+      onOpen(file);
+      return readExif(file);
+    };
     const known = new Map();
     for (const r of db.prepare('SELECT id, path, size, mtime, missing, cloud, thumb, ai_state FROM photos').all()) known.set(r.path, r);
 
@@ -195,7 +202,7 @@ export async function scanLibrary(db, shell, onProgress = () => {}) {
         if (prev && prev.size === st.size && prev.mtime === mtime) {
           if (prev.missing) batch.push(() => unmiss.run(prev.id));
           if (prev.cloud && !cloud) {
-            const { taken, camera } = await readExif(file);
+            const { taken, camera } = await exifOf(file);
             batch.push(() => nowLocal.run(taken ?? null, camera ?? null, prev.id));
           } else if (!prev.cloud && cloud) {
             batch.push(() => nowCloud.run(prev.id));
@@ -205,7 +212,7 @@ export async function scanLibrary(db, shell, onProgress = () => {}) {
           if (prev.ai_state === -2) batch.push(() => retryAi.run(prev.id));
         } else {
           // Never read a cloud-only file: that would download it. Use the file's date for now.
-          const { taken, camera } = cloud ? {} : await readExif(file);
+          const { taken, camera } = cloud ? {} : await exifOf(file);
           const when = taken ?? mtime;
           if (prev) {
             changed++;
@@ -224,6 +231,7 @@ export async function scanLibrary(db, shell, onProgress = () => {}) {
       }
       stats.batchDone = group.length;
       stats.waitingOn = '';
+      log(`Batch ${stats.batches} done in ${((Date.now() - t0) / 1000).toFixed(1)}s (${stats.newPhotos} new photos so far)`);
       flush();
       setStep('looking');
     };
@@ -276,6 +284,7 @@ export async function scanLibrary(db, shell, onProgress = () => {}) {
         }
       }
     });
+    onOpen(null);
     setStep('done');
     stats.current = '';
     stats.waitingOn = '';

@@ -290,6 +290,7 @@ h2 { font-size: 21px; margin: 28px 0 12px; }
 /* ---------- background work details (My folders) ---------- */
 .work .meta { margin: 6px 0; }
 .where-line { word-break: break-all; font-family: Consolas, "Cascadia Mono", monospace; font-size: 14px; }
+.log-tail { margin: 0; max-height: 360px; overflow: auto; white-space: pre-wrap; word-break: break-all; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12.5px; line-height: 1.45; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
 .notes { margin: 10px 0; padding-left: 22px; font-size: 15px; }
 .notes li { margin: 6px 0; }
 .notes ul { padding-left: 18px; margin: 4px 0; }

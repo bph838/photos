@@ -572,7 +572,32 @@ routes.folders = async () => {
       } }, 'Remove')));
   }
   const work = h('div', { class: 'card work' });
-  view.append(addFolderControls(), h('h2', {}, 'Background work'), work);
+  // The latest lines of the app's log, live, with ways to share the whole file when asking for help.
+  const logBox = h('pre', { class: 'log-tail' }, 'Loading...');
+  let logPath = '';
+  const logCard = h('div', { class: 'card' },
+    h('p', { class: 'meta', style: { marginTop: 0, color: 'var(--muted)' } },
+      'What the app has been doing, newest at the bottom. If something seems stuck, send this log to whoever helps you with the app.'),
+    h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '10px' } },
+      h('button', { class: 'btn', onclick: async () => {
+        try {
+          const { lines } = await api.get('/api/log?lines=400');
+          await navigator.clipboard.writeText(lines.join('\n'));
+          toast('The last 400 lines of the log are copied. Paste them into an email or message.');
+        } catch {
+          toast(`Could not copy. The log file is at ${logPath}`);
+        }
+      } }, 'Copy log'),
+      h('button', { class: 'btn', onclick: () => api.post('/api/log/show') }, 'Show log file')),
+    logBox);
+  view.append(addFolderControls(), h('h2', {}, 'Background work'), work, h('h2', {}, 'Activity log'), logCard);
+  const refreshLog = async () => {
+    const { lines, path } = await api.get('/api/log?lines=30');
+    logPath = path;
+    const atBottom = logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 30;
+    logBox.textContent = lines.join('\n') || '(nothing yet)';
+    if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+  };
 
   // Keep the card up to date while this page is open.
   let wasScanning = false;
@@ -583,6 +608,7 @@ routes.folders = async () => {
       if (gen !== renderGen) return;
       const scanning = st.indexer?.phase === 'scanning';
       work.replaceChildren(...workCard(st));
+      await refreshLog();
       // Photo counts per folder change as photos are found.
       if (scanning || wasScanning) {
         for (const f of await api.get('/api/folders')) {
