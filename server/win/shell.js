@@ -37,10 +37,13 @@ class Helper {
     this.busy = false;
     this.proc = null;
     this.ready = null;
+    this.brokenUntil = 0;
   }
 
   start() {
     if (this.proc) return this.ready;
+    // It failed to start recently: don't make every request wait for it to fail again.
+    if (Date.now() < this.brokenUntil) return Promise.reject(new Error('Windows helper is not available'));
     const script = path.join(APP_ROOT, 'server', 'win', 'shell-helper.ps1');
     const proc = spawn('powershell.exe', ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', script], {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -49,10 +52,32 @@ class Helper {
     this.proc = proc;
     const rl = readline.createInterface({ input: proc.stdout });
     let onLine = null;
+    const t0 = Date.now();
     this.ready = new Promise((resolve, reject) => {
-      onLine = (l) => (l === 'ready' ? resolve() : reject(new Error(l)));
-      proc.once('exit', () => reject(new Error('Windows helper could not start')));
-    });
+      // The first start compiles a little C#, which can be slow (antivirus scans it), but not this slow.
+      const timer = setTimeout(() => {
+        reject(new Error('Windows helper took too long to start'));
+        proc.kill();
+      }, 90000);
+      onLine = (l) => {
+        clearTimeout(timer);
+        l === 'ready' ? resolve() : reject(new Error(l));
+      };
+      proc.once('exit', () => {
+        clearTimeout(timer);
+        reject(new Error('Windows helper could not start'));
+      });
+    }).then(
+      () => {
+        const secs = (Date.now() - t0) / 1000;
+        if (secs > 5) log(`Windows helper took ${secs.toFixed(0)}s to start`);
+      },
+      (e) => {
+        log('Windows helper failed to start:', e.message, '- will try again in 10 minutes');
+        this.brokenUntil = Date.now() + 10 * 60 * 1000;
+        throw e;
+      }
+    );
     rl.on('line', (l) => {
       const cb = onLine;
       onLine = null;

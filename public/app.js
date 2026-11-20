@@ -613,6 +613,12 @@ function workCard(st) {
     const n = (x) => x.toLocaleString();
     if (s.phase === 'scanning' && d.current) {
       out.push(muted(d.step === 'looking' ? 'Looking in: ' : 'Now: ', h('span', { class: 'where-line' }, d.current)));
+      if (d.step === 'cloud' && d.stepSecs >= 15) {
+        out.push(muted(`Waiting ${d.stepSecs}s for Windows to say which photos are in OneDrive/iCloud. The first time can take a minute; it gives up after 90 seconds.`));
+      }
+      if (d.step === 'dates' && d.waitingSecs >= 5) {
+        out.push(muted(`This photo has taken ${d.waitingSecs}s to read. It may be downloading from OneDrive/iCloud or a slow drive; it's skipped after 20 seconds.`));
+      }
     }
     const done = d.step === 'done';
     out.push(muted(

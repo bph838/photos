@@ -68,11 +68,21 @@ function watchFolders() {
 }
 
 // One friendly line for the sidebar while looking for photos.
+const secsSince = (t) => Math.max(0, Math.round((Date.now() - t) / 1000));
+const fileName = (p) => p.split(/[\/]/).pop();
 function scanMessage(s) {
   const n = (x) => x.toLocaleString();
   const found = `${n(s.photos)} photo${s.photos === 1 ? '' : 's'} found`;
-  if (s.step === 'cloud') return `Looking for photos... ${found}. Checking which are only in OneDrive/iCloud...`;
-  if (s.step === 'dates') return `Looking for photos... ${found}. Reading dates from new photos...`;
+  if (s.step === 'cloud') {
+    const t = secsSince(s.stepSince);
+    return `Looking for photos... ${found}. Asking Windows which of the next ${n(s.batchSize)} are only in OneDrive/iCloud` +
+      (t >= 5 ? ` (${t}s so far)` : '...');
+  }
+  if (s.step === 'dates') {
+    const wait = s.waitingOn ? secsSince(s.waitingSince) : 0;
+    return `Looking for photos... ${found}. Reading dates: ${n(s.batchDone)} of ${n(s.batchSize)} in this batch` +
+      (wait >= 5 ? ` (waiting ${wait}s on ${fileName(s.waitingOn)})` : '');
+  }
   if (s.step === 'done') return `Finished looking: ${found} in ${n(s.folders)} folder${s.folders === 1 ? '' : 's'}`;
   return `Looking for photos... ${found} so far (${n(s.folders)} folders, ${n(s.files)} files checked)`;
 }
@@ -82,6 +92,12 @@ function scanDetail(s) {
   return {
     step: s.step,
     current: s.current,
+    stepSecs: secsSince(s.stepSince),
+    waitingOn: s.waitingOn,
+    waitingSecs: s.waitingOn ? secsSince(s.waitingSince) : 0,
+    batchDone: s.batchDone,
+    batchSize: s.batchSize,
+    batches: s.batches,
     folders: s.folders,
     files: s.files,
     photos: s.photos,

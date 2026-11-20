@@ -67,19 +67,30 @@ async function* walk(dir, stats, visited = new Set()) {
   }
 }
 
+const EXIF_TIMEOUT_MS = 20000;
+
 async function readExif(file) {
+  let timer;
   try {
-    const x = await exifr.parse(file, {
-      pick: ['DateTimeOriginal', 'CreateDate', 'DateTimeDigitized', 'Make', 'Model'],
-      reviveValues: true,
-    });
+    // A file that is secretly still in the cloud (or on a sleepy network drive) can take
+    // ages to read. Don't let one photo hold up the whole scan: use its file date instead.
+    const x = await Promise.race([
+      exifr.parse(file, {
+        pick: ['DateTimeOriginal', 'CreateDate', 'DateTimeDigitized', 'Make', 'Model'],
+        reviveValues: true,
+      }),
+      new Promise((_, reject) => (timer = setTimeout(() => reject(new Error('timed out')), EXIF_TIMEOUT_MS))),
+    ]);
     if (!x) return {};
     const d = x.DateTimeOriginal || x.CreateDate || x.DateTimeDigitized;
     const taken = d instanceof Date && !isNaN(d) && d.getFullYear() > 1900 ? d.getTime() : null;
     const camera = [x.Make, x.Model].filter(Boolean).join(' ').trim() || null;
     return { taken, camera };
-  } catch {
+  } catch (e) {
+    if (e?.message === 'timed out') log(`Reading the date took over ${EXIF_TIMEOUT_MS / 1000}s, skipped:`, file);
     return {};
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -102,6 +113,12 @@ export async function scanLibrary(db, shell, onProgress = () => {}) {
   const stats = {
     step: 'looking', current: '', folders: 0, files: 0, photos: 0, newPhotos: 0, tooSmall: 0,
     other: new Map(), unreadable: [], unavailable: [], tick: null,
+    // What it is busy with right now, so a slow step shows "waiting on X for 40s" rather than looking frozen.
+    stepSince: Date.now(), waitingOn: '', waitingSince: 0, batchDone: 0, batchSize: 0, batches: 0,
+  };
+  const setStep = (step) => {
+    stats.step = step;
+    stats.stepSince = Date.now();
   };
   let lastTell = 0;
   const tell = (force) => {
@@ -111,134 +128,158 @@ export async function scanLibrary(db, shell, onProgress = () => {}) {
     onProgress(stats);
   };
   stats.tick = () => tell(false);
-  const roots = db.prepare('SELECT path FROM folders').all().map((r) => r.path);
-  const known = new Map();
-  for (const r of db.prepare('SELECT id, path, size, mtime, missing, cloud, thumb, ai_state FROM photos').all()) known.set(r.path, r);
-
-  const seen = new Set();
-  const reachableRoots = [];
-  let added = 0;
-  let changed = 0;
-  let found = 0;
-  const insert = db.prepare(
-    `INSERT INTO photos (path, folder, filename, size, mtime, taken, camera, cloud, added) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  );
-  const update = db.prepare(
-    `UPDATE photos SET size = ?, mtime = ?, taken = ?, camera = ?, cloud = ?, missing = 0, ai_state = 0, clip = NULL, thumb = 0, width = NULL, height = NULL WHERE id = ?`
-  );
-  const unmiss = db.prepare('UPDATE photos SET missing = 0 WHERE id = ?');
-  // Became local (opened, or "always keep on this device"): now we can read its real date.
-  const nowLocal = db.prepare('UPDATE photos SET cloud = 0, taken = COALESCE(?, taken), camera = COALESCE(?, camera) WHERE id = ?');
-  // Space freed up again: stay away from the file, keep everything we learned.
-  const nowCloud = db.prepare('UPDATE photos SET cloud = 1 WHERE id = ?');
-  const retryThumb = db.prepare('UPDATE photos SET thumb = 0 WHERE id = ?');
-  const retryAi = db.prepare('UPDATE photos SET ai_state = 0 WHERE id = ?');
-
-  let batch = [];
-  const flush = () => {
-    if (!batch.length) return;
-    const work = batch;
-    batch = [];
-    tx(db, () => work.forEach((fn) => fn()));
-  };
-
-  // Files are handled in groups so cloud status can be asked for many at once.
-  const handle = async (group) => {
-    stats.step = 'cloud';
-    tell(true);
-    const attrs = shell ? await shell.attributes(group.map((g) => g.file)) : group.map(() => null);
-    stats.step = 'dates';
-    for (let i = 0; i < group.length; i++) {
-      const { file, st } = group[i];
-      const cloud = isCloudOnly(attrs[i]) ? 1 : 0;
-      const prev = known.get(file);
-      stats.current = file;
-      tell(false);
-      const mtime = Math.round(st.mtimeMs);
-      if (prev && prev.size === st.size && prev.mtime === mtime) {
-        if (prev.missing) batch.push(() => unmiss.run(prev.id));
-        if (prev.cloud && !cloud) {
-          const { taken, camera } = await readExif(file);
-          batch.push(() => nowLocal.run(taken ?? null, camera ?? null, prev.id));
-        } else if (!prev.cloud && cloud) {
-          batch.push(() => nowCloud.run(prev.id));
-        }
-        // Cloud previews that weren't available last time (e.g. offline): try again.
-        if (prev.thumb === -2) batch.push(() => retryThumb.run(prev.id));
-        if (prev.ai_state === -2) batch.push(() => retryAi.run(prev.id));
-      } else {
-        // Never read a cloud-only file: that would download it. Use the file's date for now.
-        const { taken, camera } = cloud ? {} : await readExif(file);
-        const when = taken ?? mtime;
-        if (prev) {
-          changed++;
-          batch.push(() => {
-            forgetDerived(db, prev.id);
-            update.run(st.size, mtime, when, camera ?? null, cloud, prev.id);
-          });
-        } else {
-          added++;
-          stats.newPhotos++;
-          batch.push(() =>
-            insert.run(file, path.dirname(file), path.basename(file), st.size, mtime, when, camera ?? null, cloud, Date.now())
-          );
-        }
-      }
-    }
-    flush();
-    stats.step = 'looking';
-  };
-
-  let group = [];
-  for (const root of roots) {
-    if (!fs.existsSync(root)) {
-      log('Library folder not available (unplugged drive?):', root);
-      stats.unavailable.push(root);
-      continue;
-    }
-    reachableRoots.push(root);
-    for await (const file of walk(root, stats)) {
-      let st;
-      try {
-        st = await fs.promises.stat(file); // stat does not download cloud files
-      } catch {
-        continue;
-      }
-      if (st.size < MIN_BYTES) {
-        stats.tooSmall++; // icons and tiny images
-        continue;
-      }
-      seen.add(file);
-      found++;
-      stats.photos = found;
-      tell(false);
-      group.push({ file, st });
-      if (group.length >= 200) {
-        await handle(group);
-        group = [];
-      }
-    }
+  // Keep reporting even while waiting on something slow, so the elapsed time keeps counting.
+  const heartbeat = setInterval(() => tell(true), 2000);
+  try {
+    return await scanInner();
+  } finally {
+    clearInterval(heartbeat);
   }
-  if (group.length) await handle(group);
-  flush();
 
-  // Photos we didn't see are marked missing (kept, so tags survive a drive being unplugged
-  // or a folder being temporarily renamed). Only for folders we could actually read.
-  let missing = 0;
-  const markMissing = db.prepare('UPDATE photos SET missing = 1 WHERE id = ?');
-  const inRoot = (p) => reachableRoots.some((r) => p.toLowerCase().startsWith(r.toLowerCase().replace(/[\\/]?$/, path.sep)));
-  const inAnyRoot = (p) => roots.some((r) => p.toLowerCase().startsWith(r.toLowerCase().replace(/[\\/]?$/, path.sep)));
-  tx(db, () => {
-    for (const [p, r] of known) {
-      if (r.missing || seen.has(p)) continue;
-      if (inRoot(p) || !inAnyRoot(p)) {
-        markMissing.run(r.id);
-        missing++;
+  async function scanInner() {
+    const roots = db.prepare('SELECT path FROM folders').all().map((r) => r.path);
+    const known = new Map();
+    for (const r of db.prepare('SELECT id, path, size, mtime, missing, cloud, thumb, ai_state FROM photos').all()) known.set(r.path, r);
+
+    const seen = new Set();
+    const reachableRoots = [];
+    let added = 0;
+    let changed = 0;
+    let found = 0;
+    const insert = db.prepare(
+      `INSERT INTO photos (path, folder, filename, size, mtime, taken, camera, cloud, added) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    const update = db.prepare(
+      `UPDATE photos SET size = ?, mtime = ?, taken = ?, camera = ?, cloud = ?, missing = 0, ai_state = 0, clip = NULL, thumb = 0, width = NULL, height = NULL WHERE id = ?`
+    );
+    const unmiss = db.prepare('UPDATE photos SET missing = 0 WHERE id = ?');
+    // Became local (opened, or "always keep on this device"): now we can read its real date.
+    const nowLocal = db.prepare('UPDATE photos SET cloud = 0, taken = COALESCE(?, taken), camera = COALESCE(?, camera) WHERE id = ?');
+    // Space freed up again: stay away from the file, keep everything we learned.
+    const nowCloud = db.prepare('UPDATE photos SET cloud = 1 WHERE id = ?');
+    const retryThumb = db.prepare('UPDATE photos SET thumb = 0 WHERE id = ?');
+    const retryAi = db.prepare('UPDATE photos SET ai_state = 0 WHERE id = ?');
+
+    let batch = [];
+    const flush = () => {
+      if (!batch.length) return;
+      const work = batch;
+      batch = [];
+      tx(db, () => work.forEach((fn) => fn()));
+    };
+
+    // Files are handled in groups so cloud status can be asked for many at once.
+    const handle = async (group) => {
+      stats.batches++;
+      stats.batchSize = group.length;
+      stats.batchDone = 0;
+      setStep('cloud');
+      tell(true);
+      const t0 = Date.now();
+      const attrs = shell ? await shell.attributes(group.map((g) => g.file)) : group.map(() => null);
+      if (Date.now() - t0 > 10000) log(`Checking cloud status of ${group.length} files took ${Math.round((Date.now() - t0) / 1000)}s`);
+      const unknown = attrs.filter((a) => a == null).length;
+      if (shell?.enabled && unknown) log(`Cloud status unknown for ${unknown} of ${group.length} files (treated as on this PC)`);
+      setStep('dates');
+      log(`Scan: ${stats.photos} photos found in ${stats.folders} folders; checking batch ${stats.batches} (${group.length} files) in`, path.dirname(group[0].file));
+      for (let i = 0; i < group.length; i++) {
+        const { file, st } = group[i];
+        const cloud = isCloudOnly(attrs[i]) ? 1 : 0;
+        const prev = known.get(file);
+        stats.current = file;
+        stats.batchDone = i;
+        stats.waitingOn = file;
+        stats.waitingSince = Date.now();
+        tell(false);
+        const mtime = Math.round(st.mtimeMs);
+        if (prev && prev.size === st.size && prev.mtime === mtime) {
+          if (prev.missing) batch.push(() => unmiss.run(prev.id));
+          if (prev.cloud && !cloud) {
+            const { taken, camera } = await readExif(file);
+            batch.push(() => nowLocal.run(taken ?? null, camera ?? null, prev.id));
+          } else if (!prev.cloud && cloud) {
+            batch.push(() => nowCloud.run(prev.id));
+          }
+          // Cloud previews that weren't available last time (e.g. offline): try again.
+          if (prev.thumb === -2) batch.push(() => retryThumb.run(prev.id));
+          if (prev.ai_state === -2) batch.push(() => retryAi.run(prev.id));
+        } else {
+          // Never read a cloud-only file: that would download it. Use the file's date for now.
+          const { taken, camera } = cloud ? {} : await readExif(file);
+          const when = taken ?? mtime;
+          if (prev) {
+            changed++;
+            batch.push(() => {
+              forgetDerived(db, prev.id);
+              update.run(st.size, mtime, when, camera ?? null, cloud, prev.id);
+            });
+          } else {
+            added++;
+            stats.newPhotos++;
+            batch.push(() =>
+              insert.run(file, path.dirname(file), path.basename(file), st.size, mtime, when, camera ?? null, cloud, Date.now())
+            );
+          }
+        }
+      }
+      stats.batchDone = group.length;
+      stats.waitingOn = '';
+      flush();
+      setStep('looking');
+    };
+
+    let group = [];
+    for (const root of roots) {
+      if (!fs.existsSync(root)) {
+        log('Library folder not available (unplugged drive?):', root);
+        stats.unavailable.push(root);
+        continue;
+      }
+      reachableRoots.push(root);
+      for await (const file of walk(root, stats)) {
+        let st;
+        try {
+          st = await fs.promises.stat(file); // stat does not download cloud files
+        } catch {
+          continue;
+        }
+        if (st.size < MIN_BYTES) {
+          stats.tooSmall++; // icons and tiny images
+          continue;
+        }
+        seen.add(file);
+        found++;
+        stats.photos = found;
+        tell(false);
+        group.push({ file, st });
+        if (group.length >= 200) {
+          await handle(group);
+          group = [];
+        }
       }
     }
-  });
-  stats.step = 'done';
-  stats.current = '';
-  tell(true);
-  return { added, changed, missing, stats };
+    if (group.length) await handle(group);
+    flush();
+
+    // Photos we didn't see are marked missing (kept, so tags survive a drive being unplugged
+    // or a folder being temporarily renamed). Only for folders we could actually read.
+    let missing = 0;
+    const markMissing = db.prepare('UPDATE photos SET missing = 1 WHERE id = ?');
+    const inRoot = (p) => reachableRoots.some((r) => p.toLowerCase().startsWith(r.toLowerCase().replace(/[\\/]?$/, path.sep)));
+    const inAnyRoot = (p) => roots.some((r) => p.toLowerCase().startsWith(r.toLowerCase().replace(/[\\/]?$/, path.sep)));
+    tx(db, () => {
+      for (const [p, r] of known) {
+        if (r.missing || seen.has(p)) continue;
+        if (inRoot(p) || !inAnyRoot(p)) {
+          markMissing.run(r.id);
+          missing++;
+        }
+      }
+    });
+    setStep('done');
+    stats.current = '';
+    stats.waitingOn = '';
+    tell(true);
+    return { added, changed, missing, stats };
+  }
 }
